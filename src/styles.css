@@ -1,0 +1,150 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/manrope";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Surface hierarchy — "Tonal Layering" */
+  --background: #f8f9ff;
+  --foreground: #001d35;
+  --card: #ffffff;
+  --card-foreground: #001d35;
+  --popover: #ffffff;
+  --popover-foreground: #001d35;
+
+  /* Primary — HubSpot deep red-orange */
+  --primary: #a7391e;
+  --primary-foreground: #ffffff;
+
+  /* Secondary — cool blue */
+  --secondary: #cfe1f8;
+  --secondary-foreground: #536478;
+
+  /* Muted — editorial soft blue */
+  --muted: #eef4ff;
+  --muted-foreground: #58423c;
+
+  /* Accent — teal for success/integration states */
+  --accent: #eef4ff;
+  --accent-foreground: #006878;
+
+  /* Destructive — warm alert */
+  --destructive: #a7391e;
+
+  /* Borders — ghost borders only */
+  --border: rgba(223, 192, 184, 0.15);
+  --input: rgba(223, 192, 184, 0.25);
+  --ring: #a7391e;
+
+  --radius: 0.375rem;
+
+  /* Surfaces */
+  --surface-low: #eef4ff;
+  --surface-high: #d0e4ff;
+  --primary-fixed: #ffdad2;
+}
+
+.dark {
+  --background: #0a1628;
+  --foreground: #d6e3f7;
+  --card: #122036;
+  --card-foreground: #d6e3f7;
+  --popover: #122036;
+  --popover-foreground: #d6e3f7;
+
+  --primary: #ff7a59;
+  --primary-foreground: #3e0500;
+
+  --secondary: #1e3250;
+  --secondary-foreground: #b8cde4;
+
+  --muted: #162a42;
+  --muted-foreground: #9aafca;
+
+  --accent: #162a42;
+  --accent-foreground: #4db8a4;
+
+  --destructive: #ff6b4a;
+
+  --border: rgba(180, 200, 230, 0.1);
+  --input: rgba(180, 200, 230, 0.15);
+  --ring: #ff7a59;
+
+  --surface-low: #0e1e32;
+  --surface-high: #1a3050;
+  --primary-fixed: #3e1a10;
+}
+
+@theme inline {
+  --font-heading: 'Manrope Variable', 'Manrope', var(--font-sans);
+  --font-sans: 'Inter Variable', 'Inter', sans-serif;
+  --color-surface-low: var(--surface-low);
+  --color-surface-high: var(--surface-high);
+  --color-primary-fixed: var(--primary-fixed);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer components {
+  .signature-gradient {
+    background: linear-gradient(135deg, var(--primary), #ff7a59);
+  }
+  .dark .signature-gradient {
+    background: linear-gradient(135deg, #ff7a59, #ffaa90);
+  }
+  .glass-modal {
+    background: var(--card);
+    backdrop-filter: blur(24px);
+  }
+  .dark .glass-modal {
+    background: rgba(18, 32, 54, 0.95);
+  }
+  .shadow-ambient {
+    box-shadow: 0 12px 32px rgba(0, 29, 53, 0.06);
+  }
+  .dark .shadow-ambient {
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Manrope Variable', 'Manrope', var(--font-sans);
+  }
+}
