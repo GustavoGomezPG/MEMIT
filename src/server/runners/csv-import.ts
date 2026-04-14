@@ -17,36 +17,57 @@ import { readFile, writeFile, mkdir } from "fs/promises";
 import { resolve } from "path";
 
 function parseCsv(content: string): { headers: string[]; rows: Record<string, string>[] } {
-  const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (lines.length === 0) return { headers: [], rows: [] };
+  if (!content.trim()) return { headers: [], rows: [] };
 
-  function parseLine(line: string): string[] {
-    const fields: string[] = [];
-    let current = "";
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i]!;
+  // Parse character-by-character to handle multi-line quoted fields
+  const records: string[][] = [];
+  let fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const char = content[i]!;
+
+    if (inQuotes) {
       if (char === '"') {
-        if (inQuotes && line[i + 1] === '"') {
+        if (content[i + 1] === '"') {
           current += '"';
           i++;
         } else {
-          inQuotes = !inQuotes;
+          inQuotes = false;
         }
-      } else if (char === "," && !inQuotes) {
+      } else {
+        current += char;
+      }
+    } else {
+      if (char === '"') {
+        inQuotes = true;
+      } else if (char === ",") {
         fields.push(current);
         current = "";
+      } else if (char === "\n" || char === "\r") {
+        if (char === "\r" && content[i + 1] === "\n") i++;
+        fields.push(current);
+        current = "";
+        if (fields.some((f) => f !== "")) {
+          records.push(fields);
+        }
+        fields = [];
       } else {
         current += char;
       }
     }
-    fields.push(current);
-    return fields;
+  }
+  // Last record
+  fields.push(current);
+  if (fields.some((f) => f !== "")) {
+    records.push(fields);
   }
 
-  const headers = parseLine(lines[0]!);
-  const rows = lines.slice(1).map((line) => {
-    const values = parseLine(line);
+  if (records.length === 0) return { headers: [], rows: [] };
+
+  const headers = records[0]!;
+  const rows = records.slice(1).map((values) => {
     const row: Record<string, string> = {};
     for (let i = 0; i < headers.length; i++) {
       row[headers[i]!] = values[i] || "";
@@ -79,7 +100,7 @@ function formatBytes(bytes: number): string {
 
 const IMG_SRC_RE = /(?:src|data-src)=["']([^"']+)["']/gi;
 const HUBSPOT_CDN_RE = /https?:\/\/[^"'\s,]*hubspotusercontent[^"'\s,]*/gi;
-const DIRECT_URL_RE = /^https?:\/\/.+\.(png|jpe?g|gif|svg|webp|ico|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|mp4|mov|avi|webm|mp3|wav|zip|rar|csv|txt|woff2?|ttf|eot)(\?[^\s]*)?$/i;
+const DIRECT_URL_RE = /^https?:\/\/.+\.(png|jpe?g|gif|svg|webp|ico|bmp|tiff?|pdf|doc|docx|odt|rtf|xls|xlsx|xlsm|ods|ppt|pptx|odp|txt|md|csv|tsv|json|xml|mp4|mov|avi|webm|mkv|mp3|wav|ogg|flac|aac|zip|rar|7z|tar|gz|bz2|woff2?|ttf|eot|otf|eps|ai|psd|indd)(\?[^\s]*)?$/i;
 
 interface MediaEntry {
   sourceUrl: string;
@@ -95,9 +116,35 @@ function extractMediaFromCsv(
 ): Map<string, MediaEntry> {
   const media = new Map<string, MediaEntry>();
 
+  // Embed/streaming providers — these are not downloadable media
+  const EMBED_HOSTS = [
+    "player.vimeo.com", "vimeo.com",
+    "youtube.com", "www.youtube.com", "youtu.be",
+    "player.youtube.com", "www.youtube-nocookie.com",
+    "fast.wistia.com", "fast.wistia.net",
+    "play.vidyard.com", "embed.vidyard.com",
+    "www.dailymotion.com", "dai.ly",
+    "open.spotify.com", "embed.spotify.com",
+    "w.soundcloud.com",
+    "codepen.io", "jsfiddle.net",
+    "docs.google.com", "drive.google.com",
+    "maps.google.com", "www.google.com/maps",
+    "calendly.com", "app.hubspot.com",
+  ];
+
+  function isEmbedUrl(url: string): boolean {
+    try {
+      const host = new URL(url).hostname;
+      return EMBED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+    } catch {
+      return false;
+    }
+  }
+
   function addUrl(url: string, column: string) {
     const cleaned = url.trim().replace(/["'>\s]+$/, "");
     if (!cleaned || !cleaned.startsWith("http")) return;
+    if (isEmbedUrl(cleaned)) return;
 
     if (media.has(cleaned)) {
       const entry = media.get(cleaned)!;
@@ -143,7 +190,7 @@ function extractMediaFromCsv(
       }
 
       // 5. href="..." pointing to media files
-      const hrefRe = /href=["']([^"']+\.(png|jpe?g|gif|svg|webp|pdf|doc|docx|xls|xlsx|ppt|pptx|mp4|mov|zip|rar|csv)[^"']*)["']/gi;
+      const hrefRe = /href=["']([^"']+\.(png|jpe?g|gif|svg|webp|ico|bmp|tiff?|pdf|doc|docx|odt|rtf|xls|xlsx|xlsm|ods|ppt|pptx|odp|txt|md|csv|tsv|json|xml|mp4|mov|avi|webm|mkv|mp3|wav|ogg|flac|aac|zip|rar|7z|tar|gz|bz2|eps|ai|psd|indd)[^"']*)["']/gi;
       while ((match = hrefRe.exec(value)) !== null) {
         if (match[1]) addUrl(match[1], header);
       }
@@ -228,6 +275,7 @@ export async function exportCsvImport(
   }
 
   // ── Media discovery and download ──
+  manifest.warnings = [];
   const mediaDir = resolve(getDataDir(migration.id, taskId), "media");
   await mkdir(mediaDir, { recursive: true });
 
@@ -251,15 +299,19 @@ export async function exportCsvImport(
       }
 
       try {
-        const res = await fetch(url);
+        const urlPath = new URL(url).pathname;
+        const fileName = urlPath.split("/").pop() || `media-${Date.now()}`;
+        await logToTask(taskId, "info", `Downloading (${downloaded + downloadFailed + 1}/${mediaEntries.size}): ${fileName}`);
+
+        const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
         if (!res.ok) {
           downloadFailed++;
-          manifest.warnings.push(`[media] Failed to download: ${url} (HTTP ${res.status})`);
+          const reason = `HTTP ${res.status}`;
+          manifest.warnings.push(`[media] Failed to download: ${url} (${reason})`);
+          await logToTask(taskId, "warn", `Media download failed: ${url} — ${reason}`);
           continue;
         }
         const buf = Buffer.from(await res.arrayBuffer());
-        const urlPath = new URL(url).pathname;
-        const fileName = urlPath.split("/").pop() || `media-${Date.now()}`;
         const safeName = `${downloaded}-${fileName}`;
         const localPath = resolve(mediaDir, safeName);
         await writeFile(localPath, buf);
@@ -269,21 +321,21 @@ export async function exportCsvImport(
         downloaded++;
       } catch (err) {
         downloadFailed++;
-        manifest.warnings.push(
-          `[media] Failed to download: ${url} (${err instanceof Error ? err.message : String(err)})`
-        );
+        const reason = err instanceof Error ? err.message : String(err);
+        manifest.warnings.push(`[media] Failed to download: ${url} (${reason})`);
+        await logToTask(taskId, "warn", `Media download failed: ${url} — ${reason}`);
       }
     }
 
-    // Save media catalog
-    const mediaCatalog = Array.from(mediaEntries.values()).filter((e) => e.localPath);
+    // Save media catalog (all entries, including failed — retry needs them)
+    const allMedia = Array.from(mediaEntries.values());
     await writeFile(
       resolve(getDataDir(migration.id, taskId), "_media.json"),
-      JSON.stringify(mediaCatalog, null, 2),
+      JSON.stringify(allMedia, null, 2),
       "utf-8"
     );
 
-    const totalMediaBytes = mediaCatalog.reduce((sum, e) => sum + e.size, 0);
+    const totalMediaBytes = allMedia.filter((e) => e.localPath).reduce((sum, e) => sum + e.size, 0);
     await logToTask(
       taskId,
       "info",
@@ -335,6 +387,91 @@ export async function exportCsvImport(
   await logToTask(taskId, "info", `CSV parsed successfully. ${rows.length} rows ready for import.`);
 }
 
+// ── RETRY FAILED MEDIA ──
+
+export async function retryFailedMedia(
+  taskId: number,
+  migration: Migration
+): Promise<{ retried: number; succeeded: number; failed: number }> {
+  const dataDir = getDataDir(migration.id, taskId);
+  const mediaDir = resolve(dataDir, "media");
+
+  // Read catalog
+  let catalog: MediaEntry[];
+  try {
+    const raw = await readFile(resolve(dataDir, "_media.json"), "utf-8");
+    catalog = JSON.parse(raw) as MediaEntry[];
+  } catch {
+    return { retried: 0, succeeded: 0, failed: 0 };
+  }
+
+  const failedEntries = catalog.filter((e) => !e.localPath);
+  if (failedEntries.length === 0) return { retried: 0, succeeded: 0, failed: 0 };
+
+  await logToTask(taskId, "info", `Retrying ${failedEntries.length} failed media downloads...`);
+  await mkdir(mediaDir, { recursive: true });
+
+  // Count existing successful downloads for safe filename prefix
+  let fileIndex = catalog.filter((e) => e.localPath).length;
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const entry of failedEntries) {
+    try {
+      const res = await fetch(entry.sourceUrl);
+      if (!res.ok) {
+        failed++;
+        await logToTask(taskId, "warn", `Retry failed: ${entry.sourceUrl} — HTTP ${res.status}`);
+        continue;
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const urlPath = new URL(entry.sourceUrl).pathname;
+      const fileName = urlPath.split("/").pop() || `media-${Date.now()}`;
+      const safeName = `${fileIndex}-${fileName}`;
+      const localPath = resolve(mediaDir, safeName);
+      await writeFile(localPath, buf);
+
+      entry.localPath = localPath;
+      entry.size = buf.length;
+      fileIndex++;
+      succeeded++;
+      await logToTask(taskId, "info", `Retry succeeded: ${entry.sourceUrl} (${formatBytes(buf.length)})`);
+    } catch (err) {
+      failed++;
+      await logToTask(taskId, "warn", `Retry failed: ${entry.sourceUrl} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Update catalog
+  await writeFile(resolve(dataDir, "_media.json"), JSON.stringify(catalog, null, 2), "utf-8");
+
+  // Update manifest warnings — remove resolved ones, keep remaining failures
+  const { readManifest } = await import("../manifest");
+  const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+  if (task?.manifestPath) {
+    const manifest = readManifest(task.manifestPath);
+    const stillFailed = new Set(catalog.filter((e) => !e.localPath).map((e) => e.sourceUrl));
+    manifest.warnings = manifest.warnings.filter((w) => {
+      const urlMatch = w.match(/Failed to download: (\S+)/);
+      return !urlMatch || stillFailed.has(urlMatch[1]!);
+    });
+    flushManifest(task.manifestPath, manifest);
+  }
+
+  // Update config counts
+  if (task?.config) {
+    try {
+      const config = JSON.parse(task.config) as Record<string, unknown>;
+      config.mediaCount = catalog.filter((e) => e.localPath).length;
+      config.mediaFailedCount = catalog.filter((e) => !e.localPath).length;
+      await db.update(tasks).set({ config: JSON.stringify(config) }).where(eq(tasks.id, taskId));
+    } catch { /* */ }
+  }
+
+  await logToTask(taskId, "info", `Retry complete: ${succeeded} succeeded, ${failed} still failing`);
+  return { retried: failedEntries.length, succeeded, failed };
+}
+
 // ── IMPORT PHASE ──
 
 export async function importCsvImport(
@@ -345,7 +482,7 @@ export async function importCsvImport(
   const ctx = await createRunnerContext(taskId, migration, options);
   if (!ctx) return;
 
-  const { targetToken, manifestPath, dryRun, outputType } = ctx;
+  const { targetToken, manifestPath, dryRun, outputType, uploadFolderPath } = ctx;
   const manifest = ctx.manifest;
 
   await db.update(tasks).set({ status: "importing", phase: "import" }).where(eq(tasks.id, taskId));
@@ -364,6 +501,8 @@ export async function importCsvImport(
     csvColumnTypes: Record<string, string>;
     csvRowCount: number;
     mediaCount?: number;
+    hubdbTableName?: string;
+    mediaFolderPath?: string;
   };
 
   const csvContent = await readFile(config.csvFilePath, "utf-8");
@@ -396,31 +535,55 @@ export async function importCsvImport(
         await logToTask(taskId, "info", `[DRY RUN]   ...and ${mediaCatalog.length - 10} more files`);
       }
     } else {
-      await logToTask(taskId, "info", `Uploading ${mediaCatalog.length} media files to target portal...`);
+      const uploadable = mediaCatalog.filter((e) => e.localPath && !urlMapping[e.sourceUrl]);
+      const alreadyMapped = mediaCatalog.filter((e) => urlMapping[e.sourceUrl]);
+      mediaSkipped = alreadyMapped.length;
+      await logToTask(taskId, "info", `Uploading ${uploadable.length} media files to target portal (${mediaSkipped} already mapped)...`);
 
-      for (const entry of mediaCatalog) {
-        if (urlMapping[entry.sourceUrl]) {
-          mediaSkipped++;
-          continue;
-        }
-        if (!entry.localPath) continue;
+      for (let mi = 0; mi < uploadable.length; mi++) {
+        const entry = uploadable[mi]!;
+        const fileName = entry.localPath!.split("/").pop() || `media-${Date.now()}`;
 
         try {
-          const fileBuffer = Buffer.from(await readFile(entry.localPath));
-          const fileName = entry.localPath.split("/").pop() || `media-${Date.now()}`;
-          const uploaded = await uploadFile(targetToken, fileBuffer, fileName);
+          if ((mi + 1) % 10 === 0 || mi === 0) {
+            await logToTask(taskId, "info", `Media upload progress: ${mi + 1}/${uploadable.length} — ${fileName}`);
+          }
+          const fileBuffer = Buffer.from(await readFile(entry.localPath!));
+          const uploaded = await uploadFile(targetToken, fileBuffer, fileName, undefined, uploadFolderPath);
           urlMapping[entry.sourceUrl] = uploaded.url;
           mediaUploaded++;
-        } catch (err) {
-          await logToTask(
-            taskId,
-            "warn",
-            `Failed to upload media: ${entry.sourceUrl} (${err instanceof Error ? err.message : String(err)})`
-          );
+        } catch {
+          // Fallback: import-from-URL (HubSpot fetches the file — better for large files)
+          try {
+            await logToTask(taskId, "info", `Direct upload failed for ${fileName}, trying import-from-URL...`);
+            const { importFileFromUrl } = await import("../hubspot");
+            const imported = await importFileFromUrl(targetToken, entry.sourceUrl, fileName, undefined, uploadFolderPath);
+            urlMapping[entry.sourceUrl] = imported.url;
+            mediaUploaded++;
+          } catch (err) {
+            await logToTask(
+              taskId,
+              "warn",
+              `Failed to upload media: ${fileName} — ${err instanceof Error ? err.message : String(err)}`
+            );
+          }
         }
       }
 
-      await logToTask(taskId, "info", `Media upload: ${mediaUploaded} uploaded, ${mediaSkipped} already mapped`);
+      await logToTask(taskId, "info", `Media upload complete: ${mediaUploaded} uploaded, ${mediaSkipped} already mapped`);
+
+      // Update config with import-phase media failure count
+      const stillUnmapped = mediaCatalog.filter((e) => e.localPath && !urlMapping[e.sourceUrl]).length;
+      if (stillUnmapped > 0 || mediaUploaded > 0) {
+        const latestTask = await db.select().from(tasks).where(eq(tasks.id, taskId)).then((r) => r[0]);
+        if (latestTask?.config) {
+          try {
+            const cfg = JSON.parse(latestTask.config) as Record<string, unknown>;
+            cfg.mediaFailedCount = stillUnmapped;
+            await db.update(tasks).set({ config: JSON.stringify(cfg) }).where(eq(tasks.id, taskId));
+          } catch { /* */ }
+        }
+      }
     }
   }
 
@@ -450,7 +613,9 @@ export async function importCsvImport(
 
   // Output type is HubDB
   if (dryRun) {
-    await logToTask(taskId, "info", `[DRY RUN] Would create HubDB table with ${config.csvHeaders.length} columns and ${rows.length} rows`);
+    const dryRunTableName = config.hubdbTableName ||
+      (config.csvFileName || "csv_import").replace(/\.csv$/i, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
+    await logToTask(taskId, "info", `[DRY RUN] Would create HubDB table "${dryRunTableName}" with ${config.csvHeaders.length} columns and ${rows.length} rows`);
     await logToTask(taskId, "info", `Columns: ${config.csvHeaders.map((h) => `${h} (${config.csvColumnTypes[h]})`).join(", ")}`);
 
     // Preview URL rewrites
@@ -478,10 +643,11 @@ export async function importCsvImport(
     return;
   }
 
-  const tableName = (config.csvFileName || "csv_import")
-    .replace(/\.csv$/i, "")
-    .replace(/[^a-zA-Z0-9_]/g, "_")
-    .toLowerCase();
+  const tableName = config.hubdbTableName ||
+    (config.csvFileName || "csv_import")
+      .replace(/\.csv$/i, "")
+      .replace(/[^a-zA-Z0-9_]/g, "_")
+      .toLowerCase();
 
   const existingTable = await fetchHubDbTableByName(targetToken, tableName);
   if (existingTable) {
@@ -507,7 +673,7 @@ export async function importCsvImport(
   try {
     createdTable = await createHubDbTable(targetToken, {
       name: tableName,
-      label: config.csvFileName?.replace(/\.csv$/i, "") || tableName,
+      label: config.hubdbTableName || config.csvFileName?.replace(/\.csv$/i, "") || tableName,
       columns,
     });
     await logToTask(taskId, "info", `Table created (ID: ${createdTable.id}), inserting rows...`);
@@ -559,8 +725,16 @@ export async function importCsvImport(
         if (!colId) continue;
         const rawValue = row[header] || "";
         const colType = config.csvColumnTypes[header] || "TEXT";
+
+        // Skip empty values — send null instead of empty strings
+        if (!rawValue.trim()) {
+          values[colId] = null;
+          continue;
+        }
+
         if (colType === "NUMBER") {
-          values[colId] = rawValue ? Number(rawValue) : null;
+          const num = Number(rawValue);
+          values[colId] = isNaN(num) ? null : num;
         } else if (colType === "BOOLEAN") {
           values[colId] = ["true", "yes", "1"].includes(rawValue.toLowerCase());
         } else {
@@ -577,17 +751,19 @@ export async function importCsvImport(
         if (item) item.status = "imported";
       }
       imported += batch.length;
-    } catch {
+    } catch (batchErr) {
+      await logToTask(taskId, "warn", `Batch insert failed (rows ${i + 1}-${i + batch.length}), falling back to individual inserts: ${batchErr instanceof Error ? batchErr.message : String(batchErr)}`);
       for (let j = 0; j < mappedRows.length; j++) {
         try {
           await createHubDbRow(targetToken, createdTable.id, mappedRows[j]!);
           const item = manifest.items.find((it) => it.id === `row-${i + j}`);
           if (item) item.status = "imported";
           imported++;
-        } catch {
+        } catch (rowErr) {
           const item = manifest.items.find((it) => it.id === `row-${i + j}`);
-          if (item) { item.status = "failed"; item.error = "Failed to insert row"; }
+          if (item) { item.status = "failed"; item.error = rowErr instanceof Error ? rowErr.message : String(rowErr); }
           failed++;
+          await logToTask(taskId, "warn", `Row ${i + j + 1} failed: ${rowErr instanceof Error ? rowErr.message : String(rowErr)}`);
         }
       }
     }

@@ -146,11 +146,11 @@ export async function exportMedia(
     try {
       // Download
       let downloadUrl = item.sourceUrl;
-      const response = await fetch(downloadUrl);
+      const response = await fetch(downloadUrl, { signal: AbortSignal.timeout(30_000) });
       if (!response.ok) {
         // Try signed URL
         downloadUrl = await getSignedUrl(sourceToken, item.id);
-        const retryRes = await fetch(downloadUrl);
+        const retryRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(30_000) });
         if (!retryRes.ok) throw new Error(`Download failed: ${retryRes.status}`);
         var buffer = Buffer.from(await retryRes.arrayBuffer());
       } else {
@@ -331,6 +331,42 @@ export async function importMedia(
 
   const exportedItems = manifest.items.filter((i) => i.status === "exported");
 
+  // Fast path for dry run — summary only, no per-item logging
+  if (dryRun) {
+    let wouldUpload = 0;
+    let alreadyMapped = 0;
+    let totalBytes = 0;
+
+    for (const item of exportedItems) {
+      if (urlMapping[item.sourceUrl]) {
+        item.status = "skipped";
+        item.targetUrl = urlMapping[item.sourceUrl];
+        alreadyMapped++;
+      } else {
+        item.status = "skipped";
+        wouldUpload++;
+        totalBytes += item.size;
+      }
+    }
+
+    await logToTask(
+      taskId,
+      "info",
+      `[DRY RUN] Would upload ${wouldUpload} files (${(totalBytes / 1024 / 1024).toFixed(1)} MB), ${alreadyMapped} already mapped`
+    );
+
+    // Reset and finalize
+    for (const item of manifest.items) {
+      if (item.status === "skipped") item.status = "exported";
+    }
+    manifest.phase = "exported";
+    flushManifest(manifestPath, manifest);
+
+    await db.update(tasks).set({ status: "exported", phase: "export" }).where(eq(tasks.id, taskId));
+    await logToTask(taskId, "info", "Dry run completed. Ready for real import.");
+    return;
+  }
+
   for (const item of exportedItems) {
     if (await isTaskPaused(taskId)) {
       await logToTask(taskId, "info", "Import paused");
@@ -350,17 +386,6 @@ export async function importMedia(
       continue;
     }
 
-    if (dryRun) {
-      await logToTask(
-        taskId,
-        "info",
-        `[DRY RUN] Would upload "${item.metadata.name}" (${(item.size / 1024).toFixed(1)} KB)`
-      );
-      item.status = "skipped";
-      skipped++;
-      continue;
-    }
-
     try {
       if (!item.localPath) throw new Error("No local file path");
       const fileBuffer = Buffer.from(await readFile(item.localPath));
@@ -373,7 +398,7 @@ export async function importMedia(
       const ext = item.metadata.extension as string;
       const fullName = ext && !fileName.endsWith(`.${ext}`) ? `${fileName}.${ext}` : fileName;
 
-      const uploaded = await uploadFile(targetToken, fileBuffer, fullName, folderId);
+      const uploaded = await uploadFile(targetToken, fileBuffer, fullName, folderId, folderId ? undefined : ctx.uploadFolderPath);
 
       item.targetUrl = uploaded.url;
       item.targetId = uploaded.id;
@@ -396,10 +421,11 @@ export async function importMedia(
       item.status = "failed";
       item.error = err instanceof Error ? err.message : String(err);
       failed++;
+      await logToTask(taskId, "warn", `Failed to upload: ${item.metadata.name as string} — ${item.error}`);
     }
   }
 
-  // Final
+  // Final (dry run returns early above, so this is always the real import path)
   manifest.phase = "completed";
   manifest.importedAt = new Date().toISOString();
   flushManifest(manifestPath, manifest);
@@ -415,10 +441,5 @@ export async function importMedia(
     })
     .where(eq(tasks.id, taskId));
 
-  const verb = dryRun ? "would be uploaded" : "uploaded";
-  await logToTask(
-    taskId,
-    "info",
-    `Import ${dryRun ? "(DRY RUN) " : ""}completed. ${imported} files ${verb}, ${skipped} skipped (already mapped), ${failed} failed.`
-  );
+  await logToTask(taskId, "info", `Import completed. ${imported} files uploaded, ${skipped} skipped (already mapped), ${failed} failed.`);
 }

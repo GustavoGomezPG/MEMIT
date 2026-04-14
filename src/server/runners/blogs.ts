@@ -43,6 +43,7 @@ import { resolve } from "path";
 
 const IMG_SRC_RE = /(?:src|data-src)=["']([^"']+)["']/gi;
 const HUBSPOT_CDN_RE = /https?:\/\/[^"'\s]*hubspotusercontent[^"'\s]*/gi;
+const HREF_MEDIA_RE = /href=["']([^"']+\.(png|jpe?g|gif|svg|webp|ico|bmp|tiff?|pdf|doc|docx|odt|rtf|xls|xlsx|xlsm|ods|ppt|pptx|odp|txt|md|csv|tsv|json|xml|mp4|mov|avi|webm|mkv|mp3|wav|ogg|flac|aac|zip|rar|7z|tar|gz|bz2|eps|ai|psd|indd)[^"']*)["']/gi;
 
 function extractMediaUrls(post: HubSpotBlogPost): string[] {
   const urls = new Set<string>();
@@ -56,6 +57,10 @@ function extractMediaUrls(post: HubSpotBlogPost): string[] {
     HUBSPOT_CDN_RE.lastIndex = 0;
     while ((match = HUBSPOT_CDN_RE.exec(post.postBody)) !== null) {
       urls.add(match[0]);
+    }
+    HREF_MEDIA_RE.lastIndex = 0;
+    while ((match = HREF_MEDIA_RE.exec(post.postBody)) !== null) {
+      if (match[1]) urls.add(match[1]);
     }
   }
   return Array.from(urls);
@@ -187,7 +192,7 @@ export async function exportBlogPosts(
 
       for (const mediaUrl of mediaUrls) {
         try {
-          const res = await fetch(mediaUrl);
+          const res = await fetch(mediaUrl, { signal: AbortSignal.timeout(30_000) });
           if (!res.ok) {
             downloadResults.set(mediaUrl, false);
             continue;
@@ -824,17 +829,20 @@ export async function importBlogPosts(
           continue;
         }
 
-        const uploaded = await uploadFile(targetToken, fileBuffer, fileName);
+        const uploaded = await uploadFile(targetToken, fileBuffer, fileName, undefined, ctx.uploadFolderPath);
         urlMapping[mediaUrl] = uploaded.url;
         mediaUploaded++;
-      } catch {
-        // Non-fatal
+        if (mediaUploaded % 10 === 0) {
+          await logToTask(taskId, "info", `Media upload progress: ${mediaUploaded} uploaded, ${mediaSkipped} skipped`);
+        }
+      } catch (err) {
+        await logToTask(taskId, "warn", `Failed to upload media: ${mediaUrl} — ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     await logToTask(
       taskId,
       "info",
-      `Media: ${mediaUploaded} uploaded, ${mediaSkipped} already mapped`
+      `Media upload complete: ${mediaUploaded} uploaded, ${mediaSkipped} already mapped`
     );
   }
 
@@ -945,24 +953,36 @@ export async function importBlogPosts(
   }
 
   // Final
-  manifest.phase = "completed";
-  manifest.importedAt = new Date().toISOString();
-  flushManifest(manifestPath, manifest);
+  if (dryRun) {
+    // Reset items back to exported so the real import can run
+    for (const item of manifest.items) {
+      if (item.status === "skipped") item.status = "exported";
+    }
+    manifest.phase = "exported";
+    flushManifest(manifestPath, manifest);
 
-  await db
-    .update(tasks)
-    .set({
-      status: "completed",
-      completedAt: new Date(),
-      importedItems: imported,
-      failedItems: failed,
-      urlMapping: JSON.stringify(urlMapping),
-    })
-    .where(eq(tasks.id, taskId));
+    await db
+      .update(tasks)
+      .set({ status: "exported", phase: "export" })
+      .where(eq(tasks.id, taskId));
 
-  await logToTask(
-    taskId,
-    "info",
-    `Import ${dryRun ? "(DRY RUN) " : ""}completed. ${imported} posts created, ${skipped} skipped, ${failed} failed.`
-  );
+    await logToTask(taskId, "info", `Dry run completed. ${skipped} posts previewed, ${failed} failed. Ready for real import.`);
+  } else {
+    manifest.phase = "completed";
+    manifest.importedAt = new Date().toISOString();
+    flushManifest(manifestPath, manifest);
+
+    await db
+      .update(tasks)
+      .set({
+        status: "completed",
+        completedAt: new Date(),
+        importedItems: imported,
+        failedItems: failed,
+        urlMapping: JSON.stringify(urlMapping),
+      })
+      .where(eq(tasks.id, taskId));
+
+    await logToTask(taskId, "info", `Import completed. ${imported} posts created, ${skipped} skipped, ${failed} failed.`);
+  }
 }

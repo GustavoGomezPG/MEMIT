@@ -246,17 +246,40 @@ export async function createBlogPost(
 
 // ── Files ──
 
+/**
+ * Sanitize a filename for HubSpot upload — decode URL encoding,
+ * strip illegal characters, collapse whitespace.
+ */
+function sanitizeFileName(name: string): string {
+  let clean = decodeURIComponent(name);
+  // Get extension before cleaning
+  const extMatch = clean.match(/\.([a-zA-Z0-9]+)$/);
+  const ext = extMatch ? extMatch[1] : "";
+  // Remove extension for cleaning
+  if (ext) clean = clean.slice(0, -(ext.length + 1));
+  // Replace illegal chars: parentheses, brackets, special chars
+  clean = clean
+    .replace(/[()[\]{}<>]/g, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-|-$/g, "");
+  // Re-add extension
+  return ext ? `${clean}.${ext}` : clean;
+}
+
 export async function uploadFile(
   token: string,
   fileBuffer: Buffer,
   fileName: string,
-  folderId?: string
+  folderId?: string,
+  folderPath?: string
 ): Promise<HubSpotFile> {
   await throttle();
 
+  const safeName = sanitizeFileName(fileName);
   const formData = new FormData();
   const blob = new Blob([new Uint8Array(fileBuffer)]);
-  formData.append("file", blob, fileName);
+  formData.append("file", blob, safeName);
   formData.append(
     "options",
     JSON.stringify({
@@ -268,6 +291,9 @@ export async function uploadFile(
   );
   if (folderId) {
     formData.append("folderId", folderId);
+  }
+  if (folderPath) {
+    formData.append("folderPath", folderPath);
   }
 
   const res = await fetch(`${HUBSPOT_API}/files/v3/files`, {
@@ -284,6 +310,59 @@ export async function uploadFile(
   }
 
   return res.json() as Promise<HubSpotFile>;
+}
+
+/**
+ * Import a file by URL — HubSpot fetches the file directly.
+ * Better for large files since it avoids upload timeouts.
+ */
+export async function importFileFromUrl(
+  token: string,
+  url: string,
+  fileName: string,
+  folderId?: string,
+  folderPath?: string
+): Promise<HubSpotFile> {
+  const safeName = sanitizeFileName(fileName);
+  const body: Record<string, unknown> = {
+    url,
+    name: safeName,
+    access: "PUBLIC_NOT_INDEXABLE",
+    duplicateValidationStrategy: "RETURN_EXISTING",
+    duplicateValidationScope: "ENTIRE_PORTAL",
+  };
+  if (folderId) body.folderId = folderId;
+  if (folderPath) body.folderPath = folderPath;
+
+  const res = await hubspotFetch(
+    token,
+    "/files/v3/files/import-from-url/async",
+    { method: "POST", body: JSON.stringify(body) }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to import file from URL: ${res.status} ${text}`);
+  }
+
+  // Async endpoint returns a task — poll for completion
+  const taskData = (await res.json()) as { id: string; status: string; result?: HubSpotFile };
+
+  // Poll up to 60 seconds
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const pollRes = await hubspotFetch(token, `/files/v3/files/import-from-url/async/tasks/${taskData.id}`);
+    if (!pollRes.ok) continue;
+    const poll = (await pollRes.json()) as { status: string; result?: HubSpotFile };
+    if (poll.status === "COMPLETE" && poll.result) {
+      return poll.result;
+    }
+    if (poll.status === "FAILED") {
+      throw new Error(`Import from URL failed for "${fileName}"`);
+    }
+  }
+
+  throw new Error(`Import from URL timed out for "${fileName}"`);
 }
 
 // ── Blog Authors ──
@@ -721,6 +800,24 @@ export async function createHubDbRow(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Failed to create HubDB row: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubDbRow>;
+}
+
+export async function updateHubDbRow(
+  token: string,
+  tableId: string,
+  rowId: string,
+  row: { values: Record<string, unknown> }
+): Promise<HubDbRow> {
+  const res = await hubspotFetch(
+    token,
+    `/cms/v3/hubdb/tables/${tableId}/rows/${rowId}`,
+    { method: "PATCH", body: JSON.stringify(row) }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to update HubDB row: ${res.status} ${text}`);
   }
   return res.json() as Promise<HubDbRow>;
 }

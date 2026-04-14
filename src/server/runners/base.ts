@@ -95,6 +95,7 @@ export interface RunnerContext {
   manifest: Manifest;
   dryRun: boolean;
   outputType: "same_as_source" | "hubdb" | "csv";
+  uploadFolderPath: string;
 }
 
 export async function createRunnerContext(
@@ -130,6 +131,18 @@ export async function createRunnerContext(
     manifest = readManifest(manifestPath);
   }
 
+  // Upload folder: use config override or derive from migration name
+  let uploadFolderPath = "/" + migration.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (task.config) {
+    try {
+      const cfg = JSON.parse(task.config) as { mediaFolderPath?: string };
+      if (cfg.mediaFolderPath) uploadFolderPath = cfg.mediaFolderPath;
+    } catch { /* */ }
+  }
+
   return {
     taskId,
     migration,
@@ -139,5 +152,6 @@ export async function createRunnerContext(
     manifest,
     dryRun: options.dryRun || false,
     outputType: (task.outputType as RunnerContext["outputType"]) || "same_as_source",
+    uploadFolderPath,
   };
 }

@@ -287,9 +287,12 @@ export async function importHubDb(
       await logToTask(taskId, "info", `Created table "${tableData.label}" (ID: ${createdTable.id}), inserting ${tableData.rows.length} rows...`);
 
       // Column ID remapping
+      // Build column maps for ID remapping + type validation
       const sourceColIdToName: Record<string, string> = {};
+      const sourceColIdToType: Record<string, string> = {};
       for (const col of tableData.columns) {
         sourceColIdToName[String(col.id)] = col.name;
+        sourceColIdToType[String(col.id)] = col.type;
       }
       const targetColNameToId: Record<string, string> = {};
       for (const col of createdTable.columns) {
@@ -307,7 +310,19 @@ export async function importHubDb(
           for (const [key, value] of Object.entries(row.values)) {
             const colName = sourceColIdToName[key] || key;
             const targetColId = targetColNameToId[colName];
-            if (targetColId) {
+            if (!targetColId) continue;
+
+            const colType = sourceColIdToType[key] || "TEXT";
+
+            // Null/empty handling per type
+            if (value === null || value === undefined || String(value).trim() === "") {
+              mappedValues[targetColId] = null;
+            } else if (colType === "NUMBER" || colType === "CURRENCY") {
+              const num = Number(value);
+              mappedValues[targetColId] = isNaN(num) ? null : num;
+            } else if (colType === "BOOLEAN") {
+              mappedValues[targetColId] = ["true", "yes", "1"].includes(String(value).toLowerCase());
+            } else {
               mappedValues[targetColId] = value;
             }
           }
@@ -321,12 +336,15 @@ export async function importHubDb(
         try {
           await createHubDbRowsBatch(targetToken, createdTable.id, mappedRows);
           rowsInserted += batch.length;
-        } catch {
-          for (const row of mappedRows) {
+        } catch (batchErr) {
+          await logToTask(taskId, "warn", `Batch insert failed (rows ${i + 1}-${i + batch.length}), falling back to individual inserts: ${batchErr instanceof Error ? batchErr.message : String(batchErr)}`);
+          for (let j = 0; j < mappedRows.length; j++) {
             try {
-              await createHubDbRow(targetToken, createdTable.id, row);
+              await createHubDbRow(targetToken, createdTable.id, mappedRows[j]!);
               rowsInserted++;
-            } catch { /* non-fatal per row */ }
+            } catch (rowErr) {
+              await logToTask(taskId, "warn", `Row ${i + j + 1} failed: ${rowErr instanceof Error ? rowErr.message : String(rowErr)}`);
+            }
           }
         }
       }
@@ -358,19 +376,30 @@ export async function importHubDb(
     }
   }
 
-  manifest.phase = "completed";
-  manifest.importedAt = new Date().toISOString();
-  flushManifest(manifestPath, manifest);
+  if (dryRun) {
+    for (const item of manifest.items) {
+      if (item.status === "skipped") item.status = "exported";
+    }
+    manifest.phase = "exported";
+    flushManifest(manifestPath, manifest);
 
-  await db
-    .update(tasks)
-    .set({
-      status: "completed",
-      completedAt: new Date(),
-      importedItems: imported,
-      failedItems: failed,
-    })
-    .where(eq(tasks.id, taskId));
+    await db.update(tasks).set({ status: "exported", phase: "export" }).where(eq(tasks.id, taskId));
+    await logToTask(taskId, "info", `Dry run completed. ${skipped} tables previewed, ${failed} failed. Ready for real import.`);
+  } else {
+    manifest.phase = "completed";
+    manifest.importedAt = new Date().toISOString();
+    flushManifest(manifestPath, manifest);
 
-  await logToTask(taskId, "info", `Import ${dryRun ? "(DRY RUN) " : ""}completed. ${imported} tables created, ${skipped} skipped, ${failed} failed.`);
+    await db
+      .update(tasks)
+      .set({
+        status: "completed",
+        completedAt: new Date(),
+        importedItems: imported,
+        failedItems: failed,
+      })
+      .where(eq(tasks.id, taskId));
+
+    await logToTask(taskId, "info", `Import completed. ${imported} tables created, ${skipped} skipped, ${failed} failed.`);
+  }
 }

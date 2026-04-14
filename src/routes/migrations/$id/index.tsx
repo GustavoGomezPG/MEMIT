@@ -13,6 +13,7 @@ import {
   getManifestSummary,
   runTemplateExtraction,
   retryFailedMediaDownloads,
+  resetToExported,
 } from "../../../server/tasks";
 import { Badge } from "../../../components/ui/badge";
 import { Button } from "../../../components/ui/button";
@@ -49,6 +50,7 @@ function MigrationDetail() {
   const [taskWarnings, setTaskWarnings] = useState<Record<number, string[]>>(
     {}
   );
+  const [retryingMedia, setRetryingMedia] = useState<number | null>(null);
 
   useEffect(() => {
     setMigration(loaderData);
@@ -85,10 +87,10 @@ function MigrationDetail() {
   }, [migration.id]);
 
   useEffect(() => {
-    if (!hasActiveTask) return;
+    if (!hasActiveTask && retryingMedia === null) return;
     const interval = setInterval(refreshTasks, 2000);
     return () => clearInterval(interval);
-  }, [hasActiveTask, refreshTasks]);
+  }, [hasActiveTask, retryingMedia, refreshTasks]);
 
   // Load warning counts on mount
   useEffect(() => {
@@ -144,7 +146,22 @@ function MigrationDetail() {
   }
 
   async function handleRetryMedia(taskId: number) {
-    await retryFailedMediaDownloads({ data: taskId });
+    setRetryingMedia(taskId);
+    try {
+      const result = await retryFailedMediaDownloads({ data: taskId });
+      await refreshTasks();
+      if (result.retried === 0) {
+        alert("No failed media to retry — all media is already uploaded.");
+      } else {
+        alert(`Retry complete: ${result.succeeded} succeeded, ${result.failed} still failing out of ${result.retried} retried.`);
+      }
+    } finally {
+      setRetryingMedia(null);
+    }
+  }
+
+  async function handleStartOver(taskId: number) {
+    await resetToExported({ data: taskId });
     await refreshTasks();
   }
 
@@ -223,6 +240,8 @@ function MigrationDetail() {
               }}
               onTagMapping={(id) => setTagMapTaskId(id)}
               onRetryMedia={handleRetryMedia}
+              onStartOver={handleStartOver}
+              isRetryingMedia={retryingMedia === task.id}
               warningCount={taskWarnings[task.id]?.length}
               onWarningsClick={() => setWarningsTaskId(task.id)}
               isRunning={hasActiveTask}

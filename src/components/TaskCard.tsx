@@ -22,10 +22,12 @@ import {
   HardDrive,
   CheckCircle,
   Trash2,
+  Settings,
+  Loader2,
 } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import type { Task } from "../db/schema";
-import type { LogEntry } from "../server/tasks";
+import { updateTaskSettings, type LogEntry } from "../server/tasks";
 
 const typeIcons: Record<string, React.ElementType> = {
   media: Image,
@@ -57,6 +59,9 @@ interface TaskCardProps {
   onDelete: (taskId: number) => void;
   onBrowse?: (taskId: number) => void;
   onTagMapping?: (taskId: number) => void;
+  onRetryMedia?: (taskId: number) => void;
+  onStartOver?: (taskId: number) => void;
+  isRetryingMedia?: boolean;
   warningCount?: number;
   onWarningsClick?: () => void;
   isRunning?: boolean;
@@ -182,12 +187,39 @@ export function TaskCard({
   onDelete,
   onBrowse,
   onTagMapping,
+  onRetryMedia,
+  onStartOver,
+  isRetryingMedia,
   warningCount,
   onWarningsClick,
   isRunning,
 }: TaskCardProps) {
   const [logOpen, setLogOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tableName, setTableName] = useState("");
+  const [folderPath, setFolderPath] = useState("");
+  const [settingsSaved, setSettingsSaved] = useState(false);
+
+  // Initialize settings from task config
+  useEffect(() => {
+    if (task.config) {
+      try {
+        const cfg = JSON.parse(task.config) as { hubdbTableName?: string; mediaFolderPath?: string; csvFileName?: string };
+        setTableName(cfg.hubdbTableName || cfg.csvFileName?.replace(/\.csv$/i, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase() || "");
+        setFolderPath(cfg.mediaFolderPath || "");
+      } catch { /* */ }
+    }
+  }, [task.config]);
+
+  const hasFailedMedia = (() => {
+    if (!task.config) return false;
+    try {
+      const cfg = JSON.parse(task.config) as { mediaCount?: number; mediaFailedCount?: number };
+      return (cfg.mediaFailedCount || 0) > 0;
+    } catch { return false; }
+  })();
+
   const Icon = typeIcons[task.type] || FileText;
   const status = statusConfig[task.status] || statusConfig.pending!;
 
@@ -381,21 +413,64 @@ export function TaskCard({
                   <Tag className="mr-1 h-3.5 w-3.5" /> Map Tags
                 </Button>
               )}
+              {task.type === "csv_import" && warningCount && warningCount > 0 && onRetryMedia && (
+                <Button size="sm" variant="outline" onClick={() => onRetryMedia(task.id)} disabled={isRunning || isRetryingMedia}>
+                  {isRetryingMedia ? (
+                    <><Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> Retrying...</>
+                  ) : (
+                    <><RotateCcw className="mr-1 h-3.5 w-3.5" /> Retry Failed Media</>
+                  )}
+                </Button>
+              )}
             </>
           )}
 
           {task.status === "import_paused" && (
-            <Button size="sm" onClick={() => onImport(task.id, false)} disabled={isRunning}>
-              <Play className="mr-1 h-3.5 w-3.5" /> Resume
-            </Button>
+            <>
+              <Button size="sm" onClick={() => onImport(task.id, false)} disabled={isRunning}>
+                <Play className="mr-1 h-3.5 w-3.5" /> Resume
+              </Button>
+              {onStartOver && (
+                <Button size="sm" variant="outline" onClick={() => onStartOver(task.id)} disabled={isRunning}>
+                  <RotateCcw className="mr-1 h-3.5 w-3.5" /> Start Over
+                </Button>
+              )}
+            </>
           )}
 
-          {task.status === "completed" && task.localStorageBytes ? (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <HardDrive className="h-3.5 w-3.5" />
-              {fmtBytes(task.localStorageBytes)} stored locally
-            </div>
-          ) : null}
+          {task.status === "completed" && (
+            <>
+              <Button size="sm" variant="outline" onClick={() => onExport(task.id)} disabled={isRunning}>
+                <RotateCcw className="mr-1 h-3.5 w-3.5" /> Re-export
+              </Button>
+              <Button size="sm" onClick={() => onImport(task.id, false)} disabled={isRunning} className="signature-gradient border-0 text-white">
+                <Upload className="mr-1 h-3.5 w-3.5" /> Re-import
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => onImport(task.id, true)} disabled={isRunning}>
+                <Eye className="mr-1 h-3.5 w-3.5" /> Dry Run
+              </Button>
+              {onRetryMedia && (
+                <Button size="sm" variant="outline" onClick={() => onRetryMedia(task.id)} disabled={isRunning || isRetryingMedia}>
+                  {isRetryingMedia ? (
+                    <><Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> Retrying...</>
+                  ) : (
+                    <><RotateCcw className="mr-1 h-3.5 w-3.5" /> Retry Failed Media</>
+                  )}
+                </Button>
+              )}
+              {onStartOver && (
+                <Button size="sm" variant="outline" onClick={() => onStartOver(task.id)} disabled={isRunning}>
+                  <RotateCcw className="mr-1 h-3.5 w-3.5" /> Start Over
+                </Button>
+              )}
+              {task.localStorageBytes ? (
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <HardDrive className="h-3.5 w-3.5" />
+                  {fmtBytes(task.localStorageBytes)} stored locally
+                </div>
+              ) : null}
+            </>
+          )}
 
           {task.status === "failed" && (
             <Button size="sm" variant="outline" onClick={() => { task.phase === "import" ? onImport(task.id, false) : onExport(task.id); }} disabled={isRunning}>
@@ -403,6 +478,74 @@ export function TaskCard({
             </Button>
           )}
         </div>
+
+        {/* Import settings */}
+        {(task.status === "exported" || task.status === "completed" || task.status === "import_paused") && (
+          <div>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(!settingsOpen)}
+              className="flex w-full items-center justify-between text-xs text-muted-foreground hover:text-foreground"
+            >
+              <span className="flex items-center gap-1.5">
+                <Settings className="h-3 w-3" />
+                Import Settings
+              </span>
+              {settingsOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+            </button>
+            {settingsOpen && (
+              <div className="mt-2 space-y-3 rounded-lg bg-[var(--surface-low)] p-4">
+                {(task.outputType === "hubdb" || task.type === "csv_import") && (
+                  <div>
+                    <label className="mb-1 block text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                      HubDB Table Name
+                    </label>
+                    <input
+                      type="text"
+                      value={tableName}
+                      onChange={(e) => { setTableName(e.target.value); setSettingsSaved(false); }}
+                      placeholder="e.g. hubdb_resources"
+                      className="w-full rounded bg-card px-3 py-1.5 text-xs font-mono outline-none focus:ring-2 focus:ring-primary/30"
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="mb-1 block text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                    Media Upload Folder
+                  </label>
+                  <input
+                    type="text"
+                    value={folderPath}
+                    onChange={(e) => { setFolderPath(e.target.value); setSettingsSaved(false); }}
+                    placeholder="e.g. /datamax-2026"
+                    className="w-full rounded bg-card px-3 py-1.5 text-xs font-mono outline-none focus:ring-2 focus:ring-primary/30"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={async () => {
+                      await updateTaskSettings({
+                        data: {
+                          taskId: task.id,
+                          hubdbTableName: tableName || undefined,
+                          mediaFolderPath: folderPath || undefined,
+                        },
+                      });
+                      setSettingsSaved(true);
+                    }}
+                  >
+                    Save Settings
+                  </Button>
+                  {settingsSaved && (
+                    <span className="text-xs text-green-600 dark:text-green-400">Saved</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Log viewer */}
         {logEntries.length > 0 && (

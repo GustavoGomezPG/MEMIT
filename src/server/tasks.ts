@@ -271,7 +271,115 @@ export const getTask = createServerFn({ method: "GET" })
 export const deleteTask = createServerFn({ method: "POST" })
   .inputValidator((id: number) => id)
   .handler(async ({ data: id }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, id));
+    if (task) {
+      // Clean up local files
+      try {
+        const { getManifestDir } = await import("./manifest");
+        const { rm } = await import("fs/promises");
+        const dir = getManifestDir(task.migrationId, id);
+        await rm(dir, { recursive: true, force: true });
+      } catch { /* best-effort cleanup */ }
+    }
     await db.delete(tasks).where(eq(tasks.id, id));
+  });
+
+// ── Storage Cleanup ──
+
+export const getOrphanedStorage = createServerFn({ method: "GET" })
+  .inputValidator(() => undefined)
+  .handler(async () => {
+    const { resolve } = await import("path");
+    const { readdir, stat } = await import("fs/promises");
+
+    const downloadsDir = resolve(process.cwd(), "memit-downloads");
+    const orphaned: Array<{ path: string; migrationId: string; taskId: string; sizeBytes: number }> = [];
+
+    // Get all task IDs and migration IDs from DB
+    const allTasks = await db.select().from(tasks);
+    const allMigrations = await db.select().from(migrations);
+    const taskIds = new Set(allTasks.map((t) => String(t.id)));
+    const migrationIds = new Set(allMigrations.map((m) => String(m.id)));
+
+    let migrationDirs: string[];
+    try {
+      migrationDirs = await readdir(downloadsDir);
+    } catch {
+      return { orphaned: [], totalBytes: 0 };
+    }
+
+    for (const migDir of migrationDirs) {
+      const migPath = resolve(downloadsDir, migDir);
+      const migStat = await stat(migPath).catch(() => null);
+      if (!migStat?.isDirectory()) continue;
+
+      if (!migrationIds.has(migDir)) {
+        // Entire migration folder is orphaned
+        const size = await getDirSize(migPath);
+        orphaned.push({ path: migPath, migrationId: migDir, taskId: "*", sizeBytes: size });
+        continue;
+      }
+
+      // Check individual task folders
+      let taskDirs: string[];
+      try {
+        taskDirs = await readdir(migPath);
+      } catch {
+        continue;
+      }
+
+      for (const taskDir of taskDirs) {
+        const taskPath = resolve(migPath, taskDir);
+        const taskStat = await stat(taskPath).catch(() => null);
+        if (!taskStat?.isDirectory()) continue;
+
+        if (!taskIds.has(taskDir)) {
+          const size = await getDirSize(taskPath);
+          orphaned.push({ path: taskPath, migrationId: migDir, taskId: taskDir, sizeBytes: size });
+        }
+      }
+    }
+
+    const totalBytes = orphaned.reduce((sum, o) => sum + o.sizeBytes, 0);
+    return { orphaned, totalBytes };
+  });
+
+async function getDirSize(dirPath: string): Promise<number> {
+  const { readdir, stat } = await import("fs/promises");
+  const { resolve } = await import("path");
+  let total = 0;
+  try {
+    const entries = await readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = resolve(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        total += await getDirSize(fullPath);
+      } else {
+        const s = await stat(fullPath).catch(() => null);
+        if (s) total += s.size;
+      }
+    }
+  } catch { /* */ }
+  return total;
+}
+
+export const cleanupOrphanedStorage = createServerFn({ method: "POST" })
+  .inputValidator(() => undefined)
+  .handler(async () => {
+    const { rm } = await import("fs/promises");
+    const result = await getOrphanedStorage();
+    let cleaned = 0;
+    let freedBytes = 0;
+
+    for (const entry of result.orphaned) {
+      try {
+        await rm(entry.path, { recursive: true, force: true });
+        cleaned++;
+        freedBytes += entry.sizeBytes;
+      } catch { /* best-effort */ }
+    }
+
+    return { cleaned, freedBytes, total: result.orphaned.length };
   });
 
 export const getTasksForMigration = createServerFn({ method: "GET" })
@@ -436,6 +544,82 @@ export const pauseTask = createServerFn({ method: "POST" })
     return updated;
   });
 
+// ── Task Import Settings ──
+
+export const updateTaskSettings = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: { taskId: number; hubdbTableName?: string; mediaFolderPath?: string }) => data
+  )
+  .handler(async ({ data }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, data.taskId));
+    if (!task) throw new Error("Task not found");
+
+    let config: Record<string, unknown> = {};
+    if (task.config) {
+      try { config = JSON.parse(task.config); } catch { /* */ }
+    }
+
+    if (data.hubdbTableName !== undefined) {
+      config.hubdbTableName = data.hubdbTableName
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, "_")
+        .replace(/^_|_$/g, "");
+    }
+    if (data.mediaFolderPath !== undefined) {
+      config.mediaFolderPath = "/" + data.mediaFolderPath
+        .toLowerCase()
+        .replace(/[^a-z0-9-/]/g, "-")
+        .replace(/^[-/]+|[-/]+$/g, "");
+    }
+
+    await db
+      .update(tasks)
+      .set({ config: JSON.stringify(config) })
+      .where(eq(tasks.id, data.taskId));
+
+    return { saved: true, hubdbTableName: config.hubdbTableName, mediaFolderPath: config.mediaFolderPath };
+  });
+
+// ── Reset to Review ──
+
+export const resetToExported = createServerFn({ method: "POST" })
+  .inputValidator((taskId: number) => taskId)
+  .handler(async ({ data: taskId }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    if (!task) throw new Error("Task not found");
+
+    // Reset manifest items back to exported
+    if (task.manifestPath) {
+      const manifest = readManifest(task.manifestPath);
+      for (const item of manifest.items) {
+        if (item.status === "imported" || item.status === "skipped" || item.status === "failed") {
+          item.status = "exported";
+          item.targetUrl = null;
+          item.targetId = null;
+          item.error = null;
+        }
+      }
+      manifest.phase = "exported";
+      manifest.importedAt = null;
+      flushManifest(task.manifestPath, manifest);
+    }
+
+    await db
+      .update(tasks)
+      .set({
+        status: "exported",
+        phase: "export",
+        importedItems: 0,
+        failedItems: 0,
+        completedAt: null,
+        log: appendLog(task.log, "info", "Reset to review step — ready for fresh import"),
+      })
+      .where(eq(tasks.id, taskId));
+
+    const [updated] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    return updated;
+  });
+
 // ── Retry Failed Media ──
 
 export const retryFailedMediaDownloads = createServerFn({ method: "POST" })
@@ -443,13 +627,214 @@ export const retryFailedMediaDownloads = createServerFn({ method: "POST" })
   .handler(async ({ data: taskId }) => {
     const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
     if (!task) throw new Error("Task not found");
-    if (task.type !== "csv_import") throw new Error("Retry failed media only applies to CSV import tasks");
 
     const [migration] = await db.select().from(migrations).where(eq(migrations.id, task.migrationId));
     if (!migration) throw new Error("Migration not found");
 
-    const { retryFailedMedia } = await import("./runners/csv-import");
-    return retryFailedMedia(task.id, migration);
+    // Local log helper (logToTask is in runners/base, not available here)
+    async function log(level: "info" | "warn" | "error", message: string) {
+      const [t] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+      if (t) {
+        await db.update(tasks).set({ log: appendLog(t.log, level, message) }).where(eq(tasks.id, taskId));
+      }
+    }
+
+    // Retry both download failures (localPath is null) and upload failures (not in urlMapping)
+    const { getDataDir } = await import("./manifest");
+    const { resolve } = await import("path");
+    const { readFileSync } = await import("fs");
+    const { writeFileSync, mkdirSync } = await import("fs");
+    const { uploadFile, importFileFromUrl, fetchAllHubDbRows, updateHubDbRow, publishHubDbTable, fetchHubDbTableByName } = await import("./hubspot");
+
+    // Load existing URL mapping
+    const urlMapping: Record<string, string> = task.urlMapping ? JSON.parse(task.urlMapping) : {};
+
+    // Load media catalog
+    let mediaCatalog: Array<{ sourceUrl: string; localPath: string | null; size: number; foundIn?: string[] }> = [];
+    try {
+      const dataDir = getDataDir(task.migrationId, taskId);
+      const catalogRaw = readFileSync(resolve(dataDir, "_media.json"), "utf-8");
+      mediaCatalog = JSON.parse(catalogRaw);
+    } catch {
+      // No catalog — check manifest for media URLs not in mapping
+    }
+
+    // Find download failures (no local file) and upload failures (not in urlMapping)
+    const downloadFailed = mediaCatalog.filter((e) => !e.localPath);
+    const uploadFailed = mediaCatalog.filter((e) => e.localPath && !urlMapping[e.sourceUrl]);
+
+    if (downloadFailed.length === 0 && uploadFailed.length === 0) {
+      await log("info", "No failed media to retry — all media is downloaded and uploaded");
+      return { retried: 0, succeeded: 0, failed: 0 };
+    }
+
+    // Resolve target token
+    const [targetKey] = await db.select().from(serviceKeys).where(eq(serviceKeys.id, migration.targetKeyId));
+    if (!targetKey) throw new Error("Target service key not found");
+    const targetToken = targetKey.accessToken;
+
+    // Derive upload folder (use config override or migration name)
+    let uploadFolderPath = "/" + migration.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+    if (task.config) {
+      try {
+        const cfg = JSON.parse(task.config) as { mediaFolderPath?: string };
+        if (cfg.mediaFolderPath) uploadFolderPath = cfg.mediaFolderPath;
+      } catch { /* */ }
+    }
+
+    let succeeded = 0;
+    let stillFailed = 0;
+
+    // Retry downloads first
+    if (downloadFailed.length > 0) {
+      await log("info", `Retrying ${downloadFailed.length} failed media downloads...`);
+      const dataDir = getDataDir(task.migrationId, taskId);
+      const mediaDir = resolve(dataDir, "media");
+      mkdirSync(mediaDir, { recursive: true });
+      let fileIndex = mediaCatalog.filter((e) => e.localPath).length;
+
+      for (const entry of downloadFailed) {
+        try {
+          const res = await fetch(entry.sourceUrl, { signal: AbortSignal.timeout(30_000) });
+          if (!res.ok) { stillFailed++; continue; }
+          const buf = Buffer.from(await res.arrayBuffer());
+          const urlPath = new URL(entry.sourceUrl).pathname;
+          const fileName = urlPath.split("/").pop() || `media-${Date.now()}`;
+          const localPath = resolve(mediaDir, `${fileIndex}-${fileName}`);
+          writeFileSync(localPath, buf);
+          entry.localPath = localPath;
+          entry.size = buf.length;
+          fileIndex++;
+          uploadFailed.push(entry); // Now try uploading it too
+          await log("info", `Download retry succeeded: ${fileName}`);
+        } catch {
+          stillFailed++;
+        }
+      }
+      // Save updated catalog
+      writeFileSync(resolve(getDataDir(task.migrationId, taskId), "_media.json"), JSON.stringify(mediaCatalog, null, 2), "utf-8");
+    }
+
+    // Retry uploads
+    if (uploadFailed.length > 0) {
+      await log("info", `Retrying ${uploadFailed.length} failed media uploads...`);
+      for (const entry of uploadFailed) {
+        const fileName = entry.localPath!.split("/").pop() || `media-${Date.now()}`;
+        try {
+          // Try direct upload first
+          const fileBuffer = Buffer.from(readFileSync(entry.localPath!));
+          const uploaded = await uploadFile(targetToken, fileBuffer, fileName, undefined, uploadFolderPath);
+          urlMapping[entry.sourceUrl] = uploaded.url;
+          succeeded++;
+          await log("info", `Upload retry succeeded: ${fileName} → ${uploaded.url}`);
+        } catch {
+          // Fallback: import-from-URL (HubSpot fetches the file directly — better for large files)
+          try {
+            await log("info", `Direct upload failed for ${fileName}, trying import-from-URL...`);
+            const imported = await importFileFromUrl(targetToken, entry.sourceUrl, fileName, undefined, uploadFolderPath);
+            urlMapping[entry.sourceUrl] = imported.url;
+            succeeded++;
+            await log("info", `Import-from-URL succeeded: ${fileName} → ${imported.url}`);
+          } catch (err2) {
+            stillFailed++;
+            await log("warn", `All upload methods failed for ${fileName}: ${err2 instanceof Error ? err2.message : String(err2)}`);
+          }
+        }
+      }
+    }
+
+    // Patch HubDB rows with newly mapped URLs (if this is a csv_import → hubdb task)
+    if (succeeded > 0 && task.type === "csv_import" && task.outputType === "hubdb") {
+      // Build a map of old → new URLs from this retry
+      const newMappings: Record<string, string> = {};
+      for (const entry of [...downloadFailed, ...uploadFailed]) {
+        if (urlMapping[entry.sourceUrl]) {
+          newMappings[entry.sourceUrl] = urlMapping[entry.sourceUrl]!;
+        }
+      }
+
+      if (Object.keys(newMappings).length > 0) {
+        // Find the HubDB table
+        let tblConfig: Record<string, unknown> = {};
+        if (task.config) {
+          try { tblConfig = JSON.parse(task.config); } catch { /* */ }
+        }
+        const tblName = (tblConfig.hubdbTableName as string) ||
+          ((tblConfig.csvFileName as string) || "csv_import").replace(/\.csv$/i, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
+
+        try {
+          const hubdbTable = await fetchHubDbTableByName(targetToken, tblName);
+          if (hubdbTable) {
+            await log("info", `Patching HubDB table "${tblName}" rows with ${Object.keys(newMappings).length} new media URLs...`);
+            const rows = await fetchAllHubDbRows(targetToken, hubdbTable.id);
+            let patchedCount = 0;
+
+            for (const row of rows) {
+              let rowNeedsUpdate = false;
+              const updatedValues: Record<string, unknown> = {};
+
+              for (const [colId, value] of Object.entries(row.values)) {
+                if (typeof value === "string") {
+                  let newValue = value;
+                  for (const [oldUrl, newUrl] of Object.entries(newMappings)) {
+                    if (newValue.includes(oldUrl)) {
+                      newValue = newValue.split(oldUrl).join(newUrl);
+                      rowNeedsUpdate = true;
+                    }
+                  }
+                  updatedValues[colId] = newValue;
+                } else {
+                  updatedValues[colId] = value;
+                }
+              }
+
+              if (rowNeedsUpdate) {
+                try {
+                  await updateHubDbRow(targetToken, hubdbTable.id, row.id, { values: updatedValues });
+                  patchedCount++;
+                } catch (patchErr) {
+                  await log("warn", `Failed to patch row ${row.id}: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`);
+                }
+              }
+            }
+
+            if (patchedCount > 0) {
+              // Re-publish the table to make changes live
+              try {
+                await publishHubDbTable(targetToken, hubdbTable.id);
+                await log("info", `Patched ${patchedCount} rows and re-published table "${tblName}"`);
+              } catch {
+                await log("warn", `Patched ${patchedCount} rows but re-publish failed — publish manually in HubSpot`);
+              }
+            } else {
+              await log("info", "No HubDB rows needed URL patching");
+            }
+          }
+        } catch (err) {
+          await log("warn", `Could not patch HubDB rows: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
+    // Save updated mapping
+    // Update urlMapping + mediaFailedCount
+    const [latestTask] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    let updatedConfig: Record<string, unknown> = {};
+    if (latestTask?.config) {
+      try { updatedConfig = JSON.parse(latestTask.config); } catch { /* */ }
+    }
+    updatedConfig.mediaFailedCount = stillFailed;
+
+    await db
+      .update(tasks)
+      .set({ urlMapping: JSON.stringify(urlMapping), config: JSON.stringify(updatedConfig) })
+      .where(eq(tasks.id, taskId));
+
+    await log("info", `Retry complete: ${succeeded} succeeded, ${stillFailed} still failing`);
+    return { retried: failed.length, succeeded, failed: stillFailed };
   });
 
 // ── Manifest APIs ──
@@ -750,36 +1135,51 @@ export const getCsvPreviewData = createServerFn({ method: "POST" })
       return { headers: config.csvHeaders, columnTypes: config.csvColumnTypes || {}, rows: [], media: [] };
     }
 
-    // Simple CSV parser (same as in runner)
-    function parseLine(line: string): string[] {
-      const fields: string[] = [];
+    // Multi-line-aware CSV parser (handles quoted fields with newlines)
+    function parseCsvContent(csv: string): { parsedHeaders: string[]; parsedRows: Record<string, string>[] } {
+      const records: string[][] = [];
+      let fields: string[] = [];
       let current = "";
       let inQuotes = false;
-      for (let i = 0; i < line.length; i++) {
-        const char = line[i]!;
-        if (char === '"') {
-          if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-          else inQuotes = !inQuotes;
-        } else if (char === "," && !inQuotes) {
-          fields.push(current); current = "";
+
+      for (let i = 0; i < csv.length; i++) {
+        const char = csv[i]!;
+        if (inQuotes) {
+          if (char === '"') {
+            if (csv[i + 1] === '"') { current += '"'; i++; }
+            else inQuotes = false;
+          } else {
+            current += char;
+          }
         } else {
-          current += char;
+          if (char === '"') { inQuotes = true; }
+          else if (char === ",") { fields.push(current); current = ""; }
+          else if (char === "\n" || char === "\r") {
+            if (char === "\r" && csv[i + 1] === "\n") i++;
+            fields.push(current); current = "";
+            if (fields.some((f) => f !== "")) records.push(fields);
+            fields = [];
+          } else {
+            current += char;
+          }
         }
       }
       fields.push(current);
-      return fields;
+      if (fields.some((f) => f !== "")) records.push(fields);
+
+      if (records.length === 0) return { parsedHeaders: [], parsedRows: [] };
+      const parsedHeaders = records[0]!;
+      const parsedRows = records.slice(1).map((values) => {
+        const row: Record<string, string> = {};
+        for (let i = 0; i < parsedHeaders.length; i++) {
+          row[parsedHeaders[i]!] = values[i] || "";
+        }
+        return row;
+      });
+      return { parsedHeaders, parsedRows };
     }
 
-    const lines = csvContent.split("\n").map((l) => l.trim()).filter(Boolean);
-    const headers = parseLine(lines[0] || "");
-    const rows = lines.slice(1).map((line) => {
-      const values = parseLine(line);
-      const row: Record<string, string> = {};
-      for (let i = 0; i < headers.length; i++) {
-        row[headers[i]!] = values[i] || "";
-      }
-      return row;
-    });
+    const { parsedHeaders: headers, parsedRows: rows } = parseCsvContent(csvContent);
 
     // Load media catalog
     let media: Array<{ sourceUrl: string; localPath: string | null; size: number; foundIn: string[] }> = [];
