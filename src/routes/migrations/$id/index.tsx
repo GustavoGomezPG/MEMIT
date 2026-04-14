@@ -6,6 +6,7 @@ import {
 } from "../../../server/migrations";
 import {
   createTask,
+  deleteTask,
   exportTask,
   importTask,
   pauseTask,
@@ -19,6 +20,7 @@ import { CreateTaskModal } from "../../../components/CreateTaskModal";
 import { ManifestBrowser } from "../../../components/ManifestBrowser";
 import { WarningsPanel } from "../../../components/WarningsPanel";
 import { CtaMappingModal } from "../../../components/CtaMappingModal";
+import { TagMappingModal } from "../../../components/TagMappingModal";
 import { ArrowLeft, ArrowLeftRight, Plus } from "lucide-react";
 import type { Task } from "../../../db/schema";
 
@@ -40,6 +42,7 @@ function MigrationDetail() {
   const [browseTaskId, setBrowseTaskId] = useState<number | null>(null);
   const [warningsTaskId, setWarningsTaskId] = useState<number | null>(null);
   const [ctaMapTaskId, setCtaMapTaskId] = useState<number | null>(null);
+  const [tagMapTaskId, setTagMapTaskId] = useState<number | null>(null);
   const [taskWarnings, setTaskWarnings] = useState<Record<number, string[]>>(
     {}
   );
@@ -99,6 +102,8 @@ function MigrationDetail() {
     label: string;
     outputType: string;
     config?: string;
+    csvFileContent?: string;
+    csvFileName?: string;
   }) {
     await createTask({
       data: {
@@ -107,6 +112,8 @@ function MigrationDetail() {
         label: task.label,
         outputType: task.outputType as "same_as_source" | "hubdb" | "csv",
         config: task.config,
+        csvFileContent: task.csvFileContent,
+        csvFileName: task.csvFileName,
       },
     });
     setModalOpen(false);
@@ -126,6 +133,11 @@ function MigrationDetail() {
   async function handlePauseTask(taskId: number) {
     await pauseTask({ data: taskId });
     setTimeout(refreshTasks, 500);
+  }
+
+  async function handleDeleteTask(taskId: number) {
+    await deleteTask({ data: taskId });
+    await refreshTasks();
   }
 
   return (
@@ -192,7 +204,9 @@ function MigrationDetail() {
               onExport={handleExportTask}
               onImport={handleImportTask}
               onPause={handlePauseTask}
+              onDelete={handleDeleteTask}
               onBrowse={(id) => setBrowseTaskId(id)}
+              onTagMapping={(id) => setTagMapTaskId(id)}
               warningCount={taskWarnings[task.id]?.length}
               onWarningsClick={() => setWarningsTaskId(task.id)}
               isRunning={hasActiveTask}
@@ -224,6 +238,14 @@ function MigrationDetail() {
           open={!!ctaMapTaskId}
           onClose={() => setCtaMapTaskId(null)}
           taskId={ctaMapTaskId}
+        />
+      )}
+
+      {tagMapTaskId && (
+        <TagMappingModal
+          open={!!tagMapTaskId}
+          onClose={() => setTagMapTaskId(null)}
+          taskId={tagMapTaskId}
         />
       )}
 

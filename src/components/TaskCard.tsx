@@ -7,6 +7,8 @@ import {
   FileText,
   Database,
   Layout,
+  FileSpreadsheet,
+  Tag,
   Play,
   Pause,
   RotateCcw,
@@ -19,6 +21,7 @@ import {
   AlertTriangle,
   HardDrive,
   CheckCircle,
+  Trash2,
 } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import type { Task } from "../db/schema";
@@ -29,6 +32,7 @@ const typeIcons: Record<string, React.ElementType> = {
   blog_posts: FileText,
   hubdb: Database,
   page: Layout,
+  csv_import: FileSpreadsheet,
 };
 
 const statusConfig: Record<
@@ -50,7 +54,9 @@ interface TaskCardProps {
   onExport: (taskId: number) => void;
   onImport: (taskId: number, dryRun: boolean) => void;
   onPause: (taskId: number) => void;
+  onDelete: (taskId: number) => void;
   onBrowse?: (taskId: number) => void;
+  onTagMapping?: (taskId: number) => void;
   warningCount?: number;
   onWarningsClick?: () => void;
   isRunning?: boolean;
@@ -173,12 +179,15 @@ export function TaskCard({
   onExport,
   onImport,
   onPause,
+  onDelete,
   onBrowse,
+  onTagMapping,
   warningCount,
   onWarningsClick,
   isRunning,
 }: TaskCardProps) {
   const [logOpen, setLogOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const Icon = typeIcons[task.type] || FileText;
   const status = statusConfig[task.status] || statusConfig.pending!;
 
@@ -240,6 +249,35 @@ export function TaskCard({
               </button>
             ) : null}
             <Badge variant={status.variant}>{status.label}</Badge>
+            {task.status !== "exporting" && task.status !== "importing" && (
+              confirmDelete ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onDelete(task.id)}
+                    className="rounded px-2 py-1 text-[10px] font-bold text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(false)}
+                    className="rounded px-2 py-1 text-[10px] font-bold text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                  title="Delete task"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )
+            )}
           </div>
         </div>
       </CardHeader>
@@ -336,6 +374,11 @@ export function TaskCard({
               {onBrowse && (
                 <Button size="sm" variant="outline" onClick={() => onBrowse(task.id)}>
                   <FolderOpen className="mr-1 h-3.5 w-3.5" /> Browse
+                </Button>
+              )}
+              {task.type === "blog_posts" && onTagMapping && (
+                <Button size="sm" variant="outline" onClick={() => onTagMapping(task.id)}>
+                  <Tag className="mr-1 h-3.5 w-3.5" /> Map Tags
                 </Button>
               )}
             </>
