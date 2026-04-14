@@ -3,7 +3,7 @@ import { db } from "../db";
 import { tasks, migrations, serviceKeys } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { fetchAllBlogPosts, fetchAllFiles, fetchAllBlogTags, fetchContentGroups, hubspotFetch } from "./hubspot";
-import { readManifest } from "./manifest";
+import { readManifest, flushManifest } from "./manifest";
 
 // ── Logging ──
 
@@ -198,10 +198,12 @@ export const createTask = createServerFn({ method: "POST" })
   .inputValidator(
     (data: {
       migrationId: number;
-      type: "media" | "blog_posts" | "hubdb" | "page";
+      type: "media" | "blog_posts" | "hubdb" | "page" | "csv_import";
       label: string;
       outputType?: "same_as_source" | "hubdb" | "csv";
       config?: string;
+      csvFileContent?: string;
+      csvFileName?: string;
     }) => data
   )
   .handler(async ({ data }) => {
@@ -218,6 +220,43 @@ export const createTask = createServerFn({ method: "POST" })
         log: JSON.stringify([]),
       })
       .returning();
+
+    // Save CSV file to disk if provided
+    if (data.csvFileContent && data.csvFileName && task) {
+      const { getDataDir } = await import("./manifest");
+      const { resolve } = await import("path");
+      const { mkdirSync, writeFileSync } = await import("fs");
+
+      const dataDir = getDataDir(data.migrationId, task.id);
+      mkdirSync(dataDir, { recursive: true });
+
+      const csvPath = resolve(dataDir, data.csvFileName);
+      writeFileSync(csvPath, data.csvFileContent, "utf-8");
+
+      // Update config with file path
+      let config: Record<string, unknown> = {};
+      if (task.config) {
+        try {
+          config = JSON.parse(task.config);
+        } catch {
+          /* ignore */
+        }
+      }
+      config.csvFilePath = csvPath;
+      config.csvFileName = data.csvFileName;
+
+      await db
+        .update(tasks)
+        .set({ config: JSON.stringify(config) })
+        .where(eq(tasks.id, task.id));
+
+      const [updated] = await db
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, task.id));
+      return updated;
+    }
+
     return task;
   });
 
@@ -548,6 +587,106 @@ export const saveCtaMappings = createServerFn({ method: "POST" })
       }
       writeFileSync(ctasPath, JSON.stringify(ctas, null, 2), "utf-8");
     } catch { /* */ }
+
+    return { saved: true };
+  });
+
+export const getTagData = createServerFn({ method: "POST" })
+  .inputValidator((taskId: number) => taskId)
+  .handler(async ({ data: taskId }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    if (!task || !task.manifestPath) return { tags: [], posts: [] };
+
+    const manifest = readManifest(task.manifestPath);
+
+    const tagPostMap = new Map<string, Set<string>>();
+    const postNames: Record<string, string> = {};
+
+    for (const item of manifest.items) {
+      if (item.status !== "exported" && item.status !== "imported") continue;
+      const tagIds = (item.metadata.tagIds as string[]) || [];
+      const postId = item.id;
+      postNames[postId] = (item.metadata.name as string) || postId;
+
+      for (const tagId of tagIds) {
+        if (!tagPostMap.has(tagId)) tagPostMap.set(tagId, new Set());
+        tagPostMap.get(tagId)!.add(postId);
+      }
+    }
+
+    const [migration] = await db.select().from(migrations).where(eq(migrations.id, task.migrationId));
+    if (!migration) return { tags: [], posts: [] };
+
+    const [sourceKey] = await db.select().from(serviceKeys).where(eq(serviceKeys.id, migration.sourceKeyId));
+    let sourceTagNames: Record<string, string> = {};
+    if (sourceKey) {
+      try {
+        const { fetchAllBlogTags } = await import("./hubspot");
+        const sourceTags = await fetchAllBlogTags(sourceKey.accessToken);
+        sourceTagNames = Object.fromEntries(sourceTags.map((t) => [t.id, t.name]));
+      } catch { /* use IDs as fallback */ }
+    }
+
+    let tagMapping: Record<string, { action: string; name?: string; mergeInto?: string }> = {};
+    if (task.config) {
+      try {
+        const config = JSON.parse(task.config);
+        if (config.tagMapping) tagMapping = config.tagMapping;
+      } catch { /* */ }
+    }
+
+    const tags = Array.from(tagPostMap.entries()).map(([tagId, postIds]) => ({
+      id: tagId,
+      name: sourceTagNames[tagId] || tagId,
+      postCount: postIds.size,
+      postIds: Array.from(postIds),
+      mapping: tagMapping[tagId] || null,
+    }));
+
+    const posts = manifest.items
+      .filter((i) => i.status === "exported" || i.status === "imported")
+      .map((i) => ({
+        id: i.id,
+        name: (i.metadata.name as string) || i.id,
+        slug: (i.metadata.slug as string) || "",
+        tagIds: (i.metadata.tagIds as string[]) || [],
+      }));
+
+    return { tags, posts };
+  });
+
+export const saveTagMapping = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      taskId: number;
+      tagMapping: Record<string, { action: string; name?: string; mergeInto?: string }>;
+      postTagUpdates?: Record<string, string[]>;
+    }) => data
+  )
+  .handler(async ({ data }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, data.taskId));
+    if (!task) throw new Error("Task not found");
+
+    let config: Record<string, unknown> = {};
+    if (task.config) {
+      try { config = JSON.parse(task.config); } catch { /* */ }
+    }
+    config.tagMapping = data.tagMapping;
+
+    if (data.postTagUpdates && task.manifestPath) {
+      const manifest = readManifest(task.manifestPath);
+      for (const item of manifest.items) {
+        if (data.postTagUpdates[item.id]) {
+          item.metadata.tagIds = data.postTagUpdates[item.id];
+        }
+      }
+      flushManifest(task.manifestPath, manifest);
+    }
+
+    await db
+      .update(tasks)
+      .set({ config: JSON.stringify(config) })
+      .where(eq(tasks.id, data.taskId));
 
     return { saved: true };
   });
