@@ -43,6 +43,7 @@ export const tasks = sqliteTable("tasks", {
       "blog_posts",
       "hubdb",
       "page",
+      "csv_import",
     ],
   }).notNull(),
   status: text("status", {

@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef } from "react";
 import { Doughnut } from "react-chartjs-2";
 import {
   Chart as ChartJS,
@@ -23,6 +23,7 @@ import {
   Loader2,
   ArrowRight,
   ChevronLeft,
+  Upload,
 } from "lucide-react";
 ChartJS.register(ArcElement, ChartTooltip, Legend);
 
@@ -38,11 +39,20 @@ interface CreateTaskModalProps {
     label: string;
     outputType: string;
     config?: string;
+    csvFileContent?: string;
+    csvFileName?: string;
   }) => void;
   migrationId: number;
   sourceKey: ServiceKey | null;
   targetKey: ServiceKey | null;
   onSwap: () => void;
+}
+
+interface CsvFileState {
+  name: string;
+  size: number;
+  content: string;
+  rowCount: number;
 }
 
 const inputTypes = [
@@ -96,6 +106,9 @@ export function CreateTaskModal({
   const [step, setStep] = useState<
     "config" | "select-posts" | "media-summary"
   >("config");
+  const [sourceType, setSourceType] = useState<"hubspot" | "csv">("hubspot");
+  const [csvFile, setCsvFile] = useState<CsvFileState | null>(null);
+  const csvInputRef = useRef<HTMLInputElement>(null);
   const [selectedInput, setSelectedInput] = useState<string | null>(null);
   const [selectedOutput, setSelectedOutput] = useState("same_as_source");
 
@@ -122,13 +135,17 @@ export function CreateTaskModal({
   const [filterTags, setFilterTags] = useState<string[]>([]);
   const [filterStates, setFilterStates] = useState<string[]>([]);
 
-  const outputTypes = selectedInput
-    ? allOutputTypes.filter((o) =>
-        (allowedOutputs[selectedInput] || ["same_as_source", "csv"]).includes(
-          o.id
-        )
-      )
-    : allOutputTypes;
+  const csvOutputIds = ["hubdb", "csv"];
+  const outputTypes =
+    sourceType === "csv"
+      ? allOutputTypes.filter((o) => csvOutputIds.includes(o.id))
+      : selectedInput
+        ? allOutputTypes.filter((o) =>
+            (
+              allowedOutputs[selectedInput] || ["same_as_source", "csv"]
+            ).includes(o.id)
+          )
+        : allOutputTypes;
 
   function handleSelectInput(id: string) {
     setSelectedInput(id);
@@ -138,8 +155,50 @@ export function CreateTaskModal({
     }
   }
 
+  function handleSourceTypeChange(type: "hubspot" | "csv") {
+    setSourceType(type);
+    if (type === "csv") {
+      setSelectedInput(null);
+      if (selectedOutput === "same_as_source") {
+        setSelectedOutput("hubdb");
+      }
+    } else {
+      setCsvFile(null);
+    }
+  }
+
+  function readCsvFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = reader.result as string;
+      const lines = content.split("\n").filter(Boolean);
+      setCsvFile({
+        name: file.name,
+        size: file.size,
+        content,
+        rowCount: Math.max(0, lines.length - 1),
+      });
+    };
+    reader.readAsText(file);
+  }
+
+  function handleCsvFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) readCsvFile(file);
+  }
+
+  function handleCsvDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file && file.name.toLowerCase().endsWith(".csv")) {
+      readCsvFile(file);
+    }
+  }
+
   function handleClose() {
     setStep("config");
+    setSourceType("hubspot");
+    setCsvFile(null);
     setSelectedInput(null);
     setSelectedOutput("same_as_source");
     setMediaSummary(null);
@@ -192,6 +251,20 @@ export function CreateTaskModal({
   }
 
   function handleFinalCreate(postIds?: string[]) {
+    if (sourceType === "csv") {
+      if (!csvFile) return;
+      onCreate({
+        type: "csv_import",
+        label: `CSV Import — ${csvFile.name}`,
+        outputType: selectedOutput,
+        config: JSON.stringify({ sourceType: "csv" }),
+        csvFileContent: csvFile.content,
+        csvFileName: csvFile.name,
+      });
+      handleClose();
+      return;
+    }
+
     if (!selectedInput) return;
     const inputDef = inputTypes.find((t) => t.id === selectedInput);
     const config =
@@ -322,25 +395,72 @@ export function CreateTaskModal({
                     <label className="mb-3 block text-xs font-bold uppercase tracking-widest text-muted-foreground">
                       Origin Source
                     </label>
-                    <div className="flex items-center gap-4 rounded-xl bg-[var(--surface-low)] p-5">
-                      <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-card shadow-sm">
-                        <FileText className="h-5 w-5 text-accent-foreground" />
-                      </div>
-                      <div>
-                        <p className="font-bold">
-                          {sourceKey?.name || "—"}
-                        </p>
-                        <p className="text-xs text-muted-foreground">
-                          Portal #{sourceKey?.portalId || "—"}
-                        </p>
-                      </div>
+                    {/* Source type toggle */}
+                    <div className="mb-3 flex items-center gap-1 rounded-lg bg-[var(--surface-low)] p-1">
+                      <button
+                        type="button"
+                        onClick={() => handleSourceTypeChange("hubspot")}
+                        className={`flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${
+                          sourceType === "hubspot"
+                            ? "bg-card shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        <Database className="h-3 w-3" />
+                        HubSpot
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSourceTypeChange("csv")}
+                        className={`flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${
+                          sourceType === "csv"
+                            ? "bg-card shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        <FileSpreadsheet className="h-3 w-3" />
+                        CSV File
+                      </button>
                     </div>
+                    {/* Source card */}
+                    {sourceType === "hubspot" ? (
+                      <div className="flex items-center gap-4 rounded-xl bg-[var(--surface-low)] p-5">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-card shadow-sm">
+                          <FileText className="h-5 w-5 text-accent-foreground" />
+                        </div>
+                        <div>
+                          <p className="font-bold">
+                            {sourceKey?.name || "—"}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            Portal #{sourceKey?.portalId || "—"}
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-4 rounded-xl bg-[var(--surface-low)] p-5">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-card shadow-sm">
+                          <FileSpreadsheet className="h-5 w-5 text-primary" />
+                        </div>
+                        <div>
+                          <p className="font-bold">CSV Source</p>
+                          <p className="text-xs text-muted-foreground">
+                            Local file upload
+                          </p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="flex flex-col items-center justify-center pt-6">
                     <button
                       type="button"
                       onClick={onSwap}
-                      className="signature-gradient flex h-12 w-12 items-center justify-center rounded-full text-white shadow-lg transition-all hover:scale-110 active:scale-95"
+                      disabled={sourceType === "csv"}
+                      className={`flex h-12 w-12 items-center justify-center rounded-full text-white shadow-lg transition-all ${
+                        sourceType === "csv"
+                          ? "cursor-not-allowed bg-muted opacity-40"
+                          : "signature-gradient hover:scale-110 active:scale-95"
+                      }`}
                     >
                       <ArrowLeftRight className="h-5 w-5" />
                     </button>
@@ -349,6 +469,13 @@ export function CreateTaskModal({
                     <label className="mb-3 block text-xs font-bold uppercase tracking-widest text-muted-foreground">
                       Destination Target
                     </label>
+                    {/* Target type indicator */}
+                    <div className="mb-3 flex items-center gap-1 rounded-lg bg-[var(--surface-low)] p-1">
+                      <div className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-xs font-bold shadow-sm">
+                        <Database className="h-3 w-3" />
+                        HubSpot
+                      </div>
+                    </div>
                     <div className="flex items-center gap-4 rounded-xl bg-[var(--surface-low)] p-5">
                       <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-card shadow-sm">
                         <FileText className="h-5 w-5 text-accent-foreground" />
@@ -369,40 +496,105 @@ export function CreateTaskModal({
               {/* Input / Output */}
               <section className="grid grid-cols-2 gap-8">
                 <div>
-                  <div className="mb-4 flex items-center justify-between">
-                    <label className="text-sm font-bold uppercase tracking-widest text-muted-foreground">
-                      Payload Inputs
-                    </label>
-                    <span className="rounded bg-secondary px-2 py-0.5 text-[10px] font-bold text-secondary-foreground">
-                      Select Items
-                    </span>
-                  </div>
-                  <div className="space-y-3">
-                    {inputTypes.map((item) => {
-                      const selected = selectedInput === item.id;
-                      const Icon = item.icon;
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => handleSelectInput(item.id)}
-                          className={`flex w-full cursor-pointer items-center justify-between rounded-xl p-4 transition-colors ${
-                            selected
-                              ? "border-2 border-primary bg-card"
-                              : "border border-border bg-card hover:bg-[var(--surface-low)]"
-                          }`}
-                        >
-                          <div className="flex items-center gap-3">
-                            <Icon
-                              className={`h-5 w-5 ${selected ? "text-primary" : "text-muted-foreground"}`}
-                            />
-                            <span className="font-semibold">{item.label}</span>
+                  {sourceType === "csv" ? (
+                    <>
+                      <div className="mb-4 flex items-center justify-between">
+                        <label className="text-sm font-bold uppercase tracking-widest text-muted-foreground">
+                          CSV File
+                        </label>
+                        <span className="rounded bg-secondary px-2 py-0.5 text-[10px] font-bold text-secondary-foreground">
+                          Upload
+                        </span>
+                      </div>
+                      {csvFile ? (
+                        <div className="rounded-xl border-2 border-primary bg-card p-5">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <FileSpreadsheet className="h-5 w-5 text-primary" />
+                              <div>
+                                <p className="font-semibold">{csvFile.name}</p>
+                                <p className="text-xs text-muted-foreground">
+                                  {fmtBytes(csvFile.size)} &middot;{" "}
+                                  {csvFile.rowCount.toLocaleString()} rows
+                                </p>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => csvInputRef.current?.click()}
+                              className="text-xs font-bold text-primary hover:underline"
+                            >
+                              Change
+                            </button>
                           </div>
-                          <RadioDot selected={selected} />
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => csvInputRef.current?.click()}
+                          onDrop={handleCsvDrop}
+                          onDragOver={(e) => e.preventDefault()}
+                          className="flex w-full flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-border bg-card p-8 transition-colors hover:border-primary hover:bg-[var(--surface-low)]"
+                        >
+                          <Upload className="h-8 w-8 text-muted-foreground" />
+                          <div className="text-center">
+                            <p className="font-semibold">
+                              Click to select CSV file
+                            </p>
+                            <p className="mt-0.5 text-xs text-muted-foreground">
+                              or drag and drop
+                            </p>
+                          </div>
                         </button>
-                      );
-                    })}
-                  </div>
+                      )}
+                      <input
+                        ref={csvInputRef}
+                        type="file"
+                        accept=".csv"
+                        onChange={handleCsvFileSelect}
+                        className="hidden"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-4 flex items-center justify-between">
+                        <label className="text-sm font-bold uppercase tracking-widest text-muted-foreground">
+                          Payload Inputs
+                        </label>
+                        <span className="rounded bg-secondary px-2 py-0.5 text-[10px] font-bold text-secondary-foreground">
+                          Select Items
+                        </span>
+                      </div>
+                      <div className="space-y-3">
+                        {inputTypes.map((item) => {
+                          const selected = selectedInput === item.id;
+                          const Icon = item.icon;
+                          return (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => handleSelectInput(item.id)}
+                              className={`flex w-full cursor-pointer items-center justify-between rounded-xl p-4 transition-colors ${
+                                selected
+                                  ? "border-2 border-primary bg-card"
+                                  : "border border-border bg-card hover:bg-[var(--surface-low)]"
+                              }`}
+                            >
+                              <div className="flex items-center gap-3">
+                                <Icon
+                                  className={`h-5 w-5 ${selected ? "text-primary" : "text-muted-foreground"}`}
+                                />
+                                <span className="font-semibold">
+                                  {item.label}
+                                </span>
+                              </div>
+                              <RadioDot selected={selected} />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 <div>
@@ -690,11 +882,22 @@ export function CreateTaskModal({
             {step === "config" ? (
               <button
                 type="button"
-                onClick={handleNext}
-                disabled={!selectedInput}
+                onClick={
+                  sourceType === "csv"
+                    ? () => handleFinalCreate()
+                    : handleNext
+                }
+                disabled={
+                  sourceType === "csv" ? !csvFile : !selectedInput
+                }
                 className="signature-gradient flex items-center gap-2 rounded-xl px-10 py-3 font-bold text-white shadow-lg shadow-primary/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
               >
-                {selectedInput === "blog_posts" ? (
+                {sourceType === "csv" ? (
+                  <>
+                    <Rocket className="h-4 w-4" />
+                    Create Task
+                  </>
+                ) : selectedInput === "blog_posts" ? (
                   <>
                     <ArrowRight className="h-4 w-4" />
                     Select Posts

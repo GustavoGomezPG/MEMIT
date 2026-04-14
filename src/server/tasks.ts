@@ -333,6 +333,12 @@ export const exportTask = createServerFn({ method: "POST" })
     } else if (task.type === "hubdb") {
       const { exportHubDb } = await import("./runners/hubdb");
       exportHubDb(task.id, migration).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "page") {
+      const { exportPages } = await import("./runners/pages");
+      exportPages(task.id, migration).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "csv_import") {
+      const { exportCsvImport } = await import("./runners/csv-import");
+      exportCsvImport(task.id, migration).catch((err) => runnerErrorHandler(task.id, err));
     } else {
       await db
         .update(tasks)
@@ -382,6 +388,12 @@ export const importTask = createServerFn({ method: "POST" })
     } else if (task.type === "hubdb") {
       const { importHubDb } = await import("./runners/hubdb");
       importHubDb(task.id, migration, { dryRun }).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "page") {
+      const { importPages } = await import("./runners/pages");
+      importPages(task.id, migration, { dryRun }).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "csv_import") {
+      const { importCsvImport } = await import("./runners/csv-import");
+      importCsvImport(task.id, migration, { dryRun }).catch((err) => runnerErrorHandler(task.id, err));
     } else {
       await db
         .update(tasks)
