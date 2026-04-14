@@ -12,12 +12,14 @@ import {
   pauseTask,
   getManifestSummary,
   runTemplateExtraction,
+  retryFailedMediaDownloads,
 } from "../../../server/tasks";
 import { Badge } from "../../../components/ui/badge";
 import { Button } from "../../../components/ui/button";
 import { TaskCard } from "../../../components/TaskCard";
 import { CreateTaskModal } from "../../../components/CreateTaskModal";
 import { ManifestBrowser } from "../../../components/ManifestBrowser";
+import { CsvDataBrowser } from "../../../components/CsvDataBrowser";
 import { WarningsPanel } from "../../../components/WarningsPanel";
 import { CtaMappingModal } from "../../../components/CtaMappingModal";
 import { TagMappingModal } from "../../../components/TagMappingModal";
@@ -40,6 +42,7 @@ function MigrationDetail() {
   const [migration, setMigration] = useState(loaderData);
   const [modalOpen, setModalOpen] = useState(false);
   const [browseTaskId, setBrowseTaskId] = useState<number | null>(null);
+  const [csvBrowseTaskId, setCsvBrowseTaskId] = useState<number | null>(null);
   const [warningsTaskId, setWarningsTaskId] = useState<number | null>(null);
   const [ctaMapTaskId, setCtaMapTaskId] = useState<number | null>(null);
   const [tagMapTaskId, setTagMapTaskId] = useState<number | null>(null);
@@ -140,6 +143,11 @@ function MigrationDetail() {
     await refreshTasks();
   }
 
+  async function handleRetryMedia(taskId: number) {
+    await retryFailedMediaDownloads({ data: taskId });
+    await refreshTasks();
+  }
+
   return (
     <div className="space-y-10">
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -205,8 +213,16 @@ function MigrationDetail() {
               onImport={handleImportTask}
               onPause={handlePauseTask}
               onDelete={handleDeleteTask}
-              onBrowse={(id) => setBrowseTaskId(id)}
+              onBrowse={(id) => {
+                const t = migration.tasks.find((t: Task) => t.id === id);
+                if (t?.type === "csv_import") {
+                  setCsvBrowseTaskId(id);
+                } else {
+                  setBrowseTaskId(id);
+                }
+              }}
               onTagMapping={(id) => setTagMapTaskId(id)}
+              onRetryMedia={handleRetryMedia}
               warningCount={taskWarnings[task.id]?.length}
               onWarningsClick={() => setWarningsTaskId(task.id)}
               isRunning={hasActiveTask}
@@ -230,6 +246,14 @@ function MigrationDetail() {
           open={!!browseTaskId}
           onClose={() => setBrowseTaskId(null)}
           taskId={browseTaskId}
+        />
+      )}
+
+      {csvBrowseTaskId && (
+        <CsvDataBrowser
+          open={!!csvBrowseTaskId}
+          onClose={() => setCsvBrowseTaskId(null)}
+          taskId={csvBrowseTaskId}
         />
       )}
 

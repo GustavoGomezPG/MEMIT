@@ -360,7 +360,7 @@ export const importTask = createServerFn({ method: "POST" })
     const [task] = await db.select().from(tasks).where(eq(tasks.id, data.taskId));
     if (!task) throw new Error("Task not found");
 
-    const validStatuses = ["exported", "import_paused", "failed"];
+    const validStatuses = ["exported", "import_paused", "failed", "completed"];
     if (!validStatuses.includes(task.status)) {
       throw new Error(`Cannot import task in "${task.status}" state`);
     }
@@ -434,6 +434,22 @@ export const pauseTask = createServerFn({ method: "POST" })
 
     const [updated] = await db.select().from(tasks).where(eq(tasks.id, taskId));
     return updated;
+  });
+
+// ── Retry Failed Media ──
+
+export const retryFailedMediaDownloads = createServerFn({ method: "POST" })
+  .inputValidator((taskId: number) => taskId)
+  .handler(async ({ data: taskId }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    if (!task) throw new Error("Task not found");
+    if (task.type !== "csv_import") throw new Error("Retry failed media only applies to CSV import tasks");
+
+    const [migration] = await db.select().from(migrations).where(eq(migrations.id, task.migrationId));
+    if (!migration) throw new Error("Migration not found");
+
+    const { retryFailedMedia } = await import("./runners/csv-import");
+    return retryFailedMedia(task.id, migration);
   });
 
 // ── Manifest APIs ──
@@ -707,6 +723,79 @@ export const saveTagMapping = createServerFn({ method: "POST" })
       .where(eq(tasks.id, data.taskId));
 
     return { saved: true };
+  });
+
+export const getCsvPreviewData = createServerFn({ method: "POST" })
+  .inputValidator((taskId: number) => taskId)
+  .handler(async ({ data: taskId }) => {
+    const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId));
+    if (!task?.config) return { headers: [], columnTypes: {}, rows: [], media: [] };
+
+    const config = JSON.parse(task.config) as {
+      csvFilePath?: string;
+      csvHeaders?: string[];
+      csvColumnTypes?: Record<string, string>;
+    };
+
+    if (!config.csvFilePath || !config.csvHeaders) {
+      return { headers: [], columnTypes: {}, rows: [], media: [] };
+    }
+
+    // Read and parse CSV
+    const { readFileSync } = await import("fs");
+    let csvContent: string;
+    try {
+      csvContent = readFileSync(config.csvFilePath, "utf-8");
+    } catch {
+      return { headers: config.csvHeaders, columnTypes: config.csvColumnTypes || {}, rows: [], media: [] };
+    }
+
+    // Simple CSV parser (same as in runner)
+    function parseLine(line: string): string[] {
+      const fields: string[] = [];
+      let current = "";
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i]!;
+        if (char === '"') {
+          if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+          else inQuotes = !inQuotes;
+        } else if (char === "," && !inQuotes) {
+          fields.push(current); current = "";
+        } else {
+          current += char;
+        }
+      }
+      fields.push(current);
+      return fields;
+    }
+
+    const lines = csvContent.split("\n").map((l) => l.trim()).filter(Boolean);
+    const headers = parseLine(lines[0] || "");
+    const rows = lines.slice(1).map((line) => {
+      const values = parseLine(line);
+      const row: Record<string, string> = {};
+      for (let i = 0; i < headers.length; i++) {
+        row[headers[i]!] = values[i] || "";
+      }
+      return row;
+    });
+
+    // Load media catalog
+    let media: Array<{ sourceUrl: string; localPath: string | null; size: number; foundIn: string[] }> = [];
+    try {
+      const { getDataDir } = await import("./manifest");
+      const { resolve } = await import("path");
+      const catalogRaw = readFileSync(resolve(getDataDir(task.migrationId, taskId), "_media.json"), "utf-8");
+      media = JSON.parse(catalogRaw);
+    } catch { /* no media */ }
+
+    return {
+      headers: config.csvHeaders,
+      columnTypes: config.csvColumnTypes || {},
+      rows,
+      media,
+    };
   });
 
 export const getManifestSummary = createServerFn({ method: "POST" })
