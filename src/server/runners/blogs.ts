@@ -594,6 +594,19 @@ export async function importBlogPosts(
   const tagIdMapping: Record<string, string> = {};
   let contentGroupMapping: Record<string, string> = {};
 
+  // Load tag mapping from task config
+  let tagMapping: Record<string, { action: string; name?: string; mergeInto?: string }> = {};
+  try {
+    const currentTask2 = await db.select().from(tasks).where(eq(tasks.id, taskId)).then((r) => r[0]);
+    if (currentTask2?.config) {
+      const config = JSON.parse(currentTask2.config) as { tagMapping?: Record<string, { action: string; name?: string; mergeInto?: string }> };
+      if (config.tagMapping) tagMapping = config.tagMapping;
+    }
+    if (Object.keys(tagMapping).length > 0) {
+      await logToTask(taskId, "info", `Loaded tag mapping: ${Object.keys(tagMapping).length} tags have custom actions`);
+    }
+  } catch { /* no tag mapping */ }
+
   if (!dryRun) {
     // Map blog authors
     await logToTask(taskId, "info", "Resolving blog authors...");
@@ -631,10 +644,11 @@ export async function importBlogPosts(
 
     // Map tags
     await logToTask(taskId, "info", "Resolving blog tags...");
+    let targetByName = new Map<string, { id: string; name: string; [key: string]: unknown }>();
     try {
       const sourceTags = await fetchAllBlogTags(sourceToken);
       const targetTags = await fetchAllBlogTags(targetToken);
-      const targetByName = new Map(targetTags.map((t) => [t.name.toLowerCase(), t]));
+      targetByName = new Map(targetTags.map((t) => [t.name.toLowerCase(), t]));
 
       const neededTagIds = new Set(
         manifest.items.flatMap((i) => (i.metadata.tagIds as string[]) || [])
@@ -660,6 +674,30 @@ export async function importBlogPosts(
       await logToTask(taskId, "info", `Mapped ${Object.keys(tagIdMapping).length} tags`);
     } catch (err) {
       await logToTask(taskId, "warn", `Tag resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Apply tag mapping overrides
+    for (const [sourceTagId, mapping] of Object.entries(tagMapping)) {
+      if (mapping.action === "delete") {
+        delete tagIdMapping[sourceTagId];
+      } else if (mapping.action === "rename" && mapping.name) {
+        const existingByNewName = targetByName.get(mapping.name.toLowerCase());
+        if (existingByNewName) {
+          tagIdMapping[sourceTagId] = existingByNewName.id;
+        } else {
+          try {
+            const created = await createBlogTag(targetToken, { name: mapping.name });
+            tagIdMapping[sourceTagId] = created.id;
+          } catch {
+            await logToTask(taskId, "warn", `Could not create renamed tag "${mapping.name}"`);
+          }
+        }
+      } else if (mapping.action === "merge" && mapping.mergeInto) {
+        const mergeTargetId = tagIdMapping[mapping.mergeInto];
+        if (mergeTargetId) {
+          tagIdMapping[sourceTagId] = mergeTargetId;
+        }
+      }
     }
 
     // Map content groups
@@ -862,6 +900,10 @@ export async function importBlogPosts(
       const targetContentGroupId = contentGroupMapping[post.contentGroupId] || post.contentGroupId;
       const sourceTagIds = ((post as Record<string, unknown>).tagIds as string[]) || [];
       const targetTagIds = sourceTagIds
+        .filter((id) => {
+          const mapping = tagMapping[id];
+          return !mapping || mapping.action !== "delete";
+        })
         .map((id) => tagIdMapping[id] || id)
         .filter(Boolean);
 
