@@ -330,6 +330,9 @@ export const exportTask = createServerFn({ method: "POST" })
     } else if (task.type === "blog_posts") {
       const { exportBlogPosts } = await import("./runners/blogs");
       exportBlogPosts(task.id, migration).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "hubdb") {
+      const { exportHubDb } = await import("./runners/hubdb");
+      exportHubDb(task.id, migration).catch((err) => runnerErrorHandler(task.id, err));
     } else {
       await db
         .update(tasks)
@@ -376,6 +379,9 @@ export const importTask = createServerFn({ method: "POST" })
     } else if (task.type === "blog_posts") {
       const { importBlogPosts } = await import("./runners/blogs");
       importBlogPosts(task.id, migration, { dryRun }).catch((err) => runnerErrorHandler(task.id, err));
+    } else if (task.type === "hubdb") {
+      const { importHubDb } = await import("./runners/hubdb");
+      importHubDb(task.id, migration, { dryRun }).catch((err) => runnerErrorHandler(task.id, err));
     } else {
       await db
         .update(tasks)
