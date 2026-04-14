@@ -2,17 +2,23 @@ import { db } from "../../db";
 import { tasks } from "../../db/schema";
 import type { Migration } from "../../db/schema";
 import { eq } from "drizzle-orm";
-import { createRunnerContext, logToTask, isTaskPaused } from "./base";
-import { flushManifest } from "../manifest";
+import { createRunnerContext, logToTask, isTaskPaused, getExistingUrlMapping } from "./base";
+import { flushManifest, getDataDir } from "../manifest";
 import {
   createHubDbTable,
   createHubDbRowsBatch,
   createHubDbRow,
   publishHubDbTable,
   fetchHubDbTableByName,
+  uploadFile,
 } from "../hubspot";
 import { writeCsvExport } from "../csv";
-import { readFile } from "fs/promises";
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { resolve } from "path";
+
+// These imports are used by the import phase (Task 16: media upload + URL rewriting)
+void getExistingUrlMapping;
+void uploadFile;
 
 function parseCsv(content: string): { headers: string[]; rows: Record<string, string>[] } {
   const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -63,6 +69,101 @@ function inferColumnType(values: string[]): string {
   if (nonEmpty.every((v) => /^https?:\/\//i.test(v))) return "URL";
   if (nonEmpty.every((v) => !isNaN(Date.parse(v)) && /\d{4}/.test(v))) return "DATE";
   return "TEXT";
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+// ── Media URL extraction ──
+
+const IMG_SRC_RE = /(?:src|data-src)=["']([^"']+)["']/gi;
+const HUBSPOT_CDN_RE = /https?:\/\/[^"'\s,]*hubspotusercontent[^"'\s,]*/gi;
+const DIRECT_URL_RE = /^https?:\/\/.+\.(png|jpe?g|gif|svg|webp|ico|bmp|pdf|doc|docx|xls|xlsx|ppt|pptx|mp4|mov|avi|webm|mp3|wav|zip|rar|csv|txt|woff2?|ttf|eot)(\?[^\s]*)?$/i;
+
+interface MediaEntry {
+  sourceUrl: string;
+  localPath: string | null;
+  size: number;
+  foundIn: string[];
+}
+
+function extractMediaFromCsv(
+  rows: Record<string, string>[],
+  headers: string[],
+  columnTypes: Record<string, string>
+): Map<string, MediaEntry> {
+  const media = new Map<string, MediaEntry>();
+
+  function addUrl(url: string, column: string) {
+    const cleaned = url.trim().replace(/["'>\s]+$/, "");
+    if (!cleaned || !cleaned.startsWith("http")) return;
+
+    if (media.has(cleaned)) {
+      const entry = media.get(cleaned)!;
+      if (!entry.foundIn.includes(column)) entry.foundIn.push(column);
+    } else {
+      media.set(cleaned, { sourceUrl: cleaned, localPath: null, size: 0, foundIn: [column] });
+    }
+  }
+
+  for (const row of rows) {
+    for (const header of headers) {
+      const value = row[header] || "";
+      if (!value) continue;
+
+      const colType = columnTypes[header] || "TEXT";
+
+      // 1. URL or IMAGE columns — entire value is a URL
+      if (colType === "URL" || colType === "IMAGE") {
+        if (/^https?:\/\//i.test(value)) {
+          addUrl(value, header);
+        }
+        continue;
+      }
+
+      // 2. Direct URL to a media file
+      DIRECT_URL_RE.lastIndex = 0;
+      if (DIRECT_URL_RE.test(value.trim())) {
+        addUrl(value.trim(), header);
+        continue;
+      }
+
+      // 3. HubSpot CDN URLs embedded anywhere
+      HUBSPOT_CDN_RE.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = HUBSPOT_CDN_RE.exec(value)) !== null) {
+        addUrl(match[0], header);
+      }
+
+      // 4. <img> and <img data-src> in rich text / HTML
+      IMG_SRC_RE.lastIndex = 0;
+      while ((match = IMG_SRC_RE.exec(value)) !== null) {
+        if (match[1]) addUrl(match[1], header);
+      }
+
+      // 5. href="..." pointing to media files
+      const hrefRe = /href=["']([^"']+\.(png|jpe?g|gif|svg|webp|pdf|doc|docx|xls|xlsx|ppt|pptx|mp4|mov|zip|rar|csv)[^"']*)["']/gi;
+      while ((match = hrefRe.exec(value)) !== null) {
+        if (match[1]) addUrl(match[1], header);
+      }
+    }
+  }
+
+  return media;
+}
+
+/** Rewrite media URLs in a cell value using old→new mapping. Used by importCsvImport. */
+export function rewriteUrls(value: string, mapping: Record<string, string>): string {
+  let result = value;
+  for (const [oldUrl, newUrl] of Object.entries(mapping)) {
+    result = result.split(oldUrl).join(newUrl);
+  }
+  return result;
 }
 
 // ── EXPORT PHASE (parse + validate) ──
@@ -125,6 +226,81 @@ export async function exportCsvImport(
   }
   await logToTask(taskId, "info", `Column types: ${headers.map((h) => `${h} (${columnTypes[h]})`).join(", ")}`);
 
+  let config: Record<string, unknown> = {};
+  if (task?.config) {
+    try { config = JSON.parse(task.config); } catch { /* */ }
+  }
+
+  // ── Media discovery and download ──
+  const mediaDir = resolve(getDataDir(migration.id, taskId), "media");
+  await mkdir(mediaDir, { recursive: true });
+
+  await logToTask(taskId, "info", "Scanning CSV data for media URLs...");
+  const mediaEntries = extractMediaFromCsv(rows, headers, columnTypes);
+
+  if (mediaEntries.size > 0) {
+    await logToTask(
+      taskId,
+      "info",
+      `Found ${mediaEntries.size} unique media URLs across ${new Set(Array.from(mediaEntries.values()).flatMap((e) => e.foundIn)).size} columns`
+    );
+
+    let downloaded = 0;
+    let downloadFailed = 0;
+
+    for (const [url, entry] of mediaEntries) {
+      if (await isTaskPaused(taskId)) {
+        await logToTask(taskId, "info", "Export paused during media download");
+        break;
+      }
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          downloadFailed++;
+          manifest.warnings.push(`[media] Failed to download: ${url} (HTTP ${res.status})`);
+          continue;
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        const urlPath = new URL(url).pathname;
+        const fileName = urlPath.split("/").pop() || `media-${Date.now()}`;
+        const safeName = `${downloaded}-${fileName}`;
+        const localPath = resolve(mediaDir, safeName);
+        await writeFile(localPath, buf);
+
+        entry.localPath = localPath;
+        entry.size = buf.length;
+        downloaded++;
+      } catch (err) {
+        downloadFailed++;
+        manifest.warnings.push(
+          `[media] Failed to download: ${url} (${err instanceof Error ? err.message : String(err)})`
+        );
+      }
+    }
+
+    // Save media catalog
+    const mediaCatalog = Array.from(mediaEntries.values()).filter((e) => e.localPath);
+    await writeFile(
+      resolve(getDataDir(migration.id, taskId), "_media.json"),
+      JSON.stringify(mediaCatalog, null, 2),
+      "utf-8"
+    );
+
+    const totalMediaBytes = mediaCatalog.reduce((sum, e) => sum + e.size, 0);
+    await logToTask(
+      taskId,
+      "info",
+      `Media download: ${downloaded} files (${formatBytes(totalMediaBytes)}), ${downloadFailed} failed`
+    );
+
+    config.mediaCount = downloaded;
+    config.mediaFailedCount = downloadFailed;
+  } else {
+    await logToTask(taskId, "info", "No media URLs found in CSV data");
+    config.mediaCount = 0;
+  }
+
   const existingIds = new Set(manifest.items.map((i) => i.id));
   for (let i = 0; i < rows.length; i++) {
     const rowId = `row-${i}`;
@@ -143,10 +319,6 @@ export async function exportCsvImport(
     }
   }
 
-  let config: Record<string, unknown> = {};
-  if (task?.config) {
-    try { config = JSON.parse(task.config); } catch { /* */ }
-  }
   config.csvHeaders = headers;
   config.csvColumnTypes = columnTypes;
   config.csvRowCount = rows.length;
@@ -228,13 +400,10 @@ export async function importCsvImport(
   if (dryRun) {
     await logToTask(taskId, "info", `[DRY RUN] Would create HubDB table with ${config.csvHeaders.length} columns and ${rows.length} rows`);
     await logToTask(taskId, "info", `Columns: ${config.csvHeaders.map((h) => `${h} (${config.csvColumnTypes[h]})`).join(", ")}`);
-    for (const item of manifest.items) {
-      if (item.status === "exported") item.status = "skipped";
-    }
-    manifest.phase = "completed";
+    manifest.phase = "exported";
     flushManifest(manifestPath, manifest);
-    await db.update(tasks).set({ status: "completed", completedAt: new Date() }).where(eq(tasks.id, taskId));
-    await logToTask(taskId, "info", "Dry run completed.");
+    await db.update(tasks).set({ status: "exported", phase: "export" }).where(eq(tasks.id, taskId));
+    await logToTask(taskId, "info", "Dry run completed. Ready for real import.");
     return;
   }
 
