@@ -16,10 +16,6 @@ import { writeCsvExport } from "../csv";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { resolve } from "path";
 
-// These imports are used by the import phase (Task 16: media upload + URL rewriting)
-void getExistingUrlMapping;
-void uploadFile;
-
 function parseCsv(content: string): { headers: string[]; rows: Record<string, string>[] } {
   const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return { headers: [], rows: [] };
@@ -367,10 +363,66 @@ export async function importCsvImport(
     csvHeaders: string[];
     csvColumnTypes: Record<string, string>;
     csvRowCount: number;
+    mediaCount?: number;
   };
 
   const csvContent = await readFile(config.csvFilePath, "utf-8");
   const { rows } = parseCsv(csvContent);
+
+  // ── Media upload and URL rewriting ──
+  const urlMapping: Record<string, string> = await getExistingUrlMapping(migration.id);
+  let mediaUploaded = 0;
+  let mediaSkipped = 0;
+
+  let mediaCatalog: MediaEntry[] = [];
+  try {
+    const catalogRaw = await readFile(
+      resolve(getDataDir(migration.id, taskId), "_media.json"),
+      "utf-8"
+    );
+    mediaCatalog = JSON.parse(catalogRaw) as MediaEntry[];
+  } catch {
+    // No media catalog — skip media handling
+  }
+
+  if (mediaCatalog.length > 0) {
+    if (dryRun) {
+      await logToTask(taskId, "info", `[DRY RUN] Would upload ${mediaCatalog.length} media files to target portal`);
+      for (const entry of mediaCatalog.slice(0, 10)) {
+        const fileName = entry.localPath?.split("/").pop() || "unknown";
+        await logToTask(taskId, "info", `[DRY RUN]   ${fileName} (${formatBytes(entry.size)}) — found in: ${entry.foundIn.join(", ")}`);
+      }
+      if (mediaCatalog.length > 10) {
+        await logToTask(taskId, "info", `[DRY RUN]   ...and ${mediaCatalog.length - 10} more files`);
+      }
+    } else {
+      await logToTask(taskId, "info", `Uploading ${mediaCatalog.length} media files to target portal...`);
+
+      for (const entry of mediaCatalog) {
+        if (urlMapping[entry.sourceUrl]) {
+          mediaSkipped++;
+          continue;
+        }
+        if (!entry.localPath) continue;
+
+        try {
+          const fileBuffer = Buffer.from(await readFile(entry.localPath));
+          const fileName = entry.localPath.split("/").pop() || `media-${Date.now()}`;
+          const uploaded = await uploadFile(targetToken, fileBuffer, fileName);
+          urlMapping[entry.sourceUrl] = uploaded.url;
+          mediaUploaded++;
+        } catch (err) {
+          await logToTask(
+            taskId,
+            "warn",
+            `Failed to upload media: ${entry.sourceUrl} (${err instanceof Error ? err.message : String(err)})`
+          );
+        }
+      }
+
+      await logToTask(taskId, "info", `Media upload: ${mediaUploaded} uploaded, ${mediaSkipped} already mapped`);
+    }
+  }
 
   if (outputType === "csv") {
     if (dryRun) {
@@ -400,6 +452,25 @@ export async function importCsvImport(
   if (dryRun) {
     await logToTask(taskId, "info", `[DRY RUN] Would create HubDB table with ${config.csvHeaders.length} columns and ${rows.length} rows`);
     await logToTask(taskId, "info", `Columns: ${config.csvHeaders.map((h) => `${h} (${config.csvColumnTypes[h]})`).join(", ")}`);
+
+    // Preview URL rewrites
+    const mappingKeys = Object.keys(urlMapping);
+    if (mappingKeys.length > 0) {
+      let affectedCells = 0;
+      for (const row of rows) {
+        for (const header of config.csvHeaders) {
+          const value = row[header] || "";
+          for (const oldUrl of mappingKeys) {
+            if (value.includes(oldUrl)) {
+              affectedCells++;
+              break;
+            }
+          }
+        }
+      }
+      await logToTask(taskId, "info", `[DRY RUN] Would rewrite ${mappingKeys.length} media URLs across ~${affectedCells} cells`);
+    }
+
     manifest.phase = "exported";
     flushManifest(manifestPath, manifest);
     await db.update(tasks).set({ status: "exported", phase: "export" }).where(eq(tasks.id, taskId));
@@ -451,11 +522,27 @@ export async function importCsvImport(
     colNameToId[col.name] = String(col.id);
   }
 
+  // Rewrite media URLs in row data before insertion
+  const hasUrlMapping = Object.keys(urlMapping).length > 0;
+  let rewrittenRows = rows;
+  if (hasUrlMapping) {
+    await logToTask(taskId, "info", `Rewriting ${Object.keys(urlMapping).length} media URLs in row data...`);
+    rewrittenRows = rows.map((row) => {
+      const rewritten: Record<string, string> = {};
+      for (const header of config.csvHeaders) {
+        const value = row[header] || "";
+        rewritten[header] = rewriteUrls(value, urlMapping);
+      }
+      return rewritten;
+    });
+    await logToTask(taskId, "info", "URL rewriting complete");
+  }
+
   const BATCH_SIZE = 100;
   let imported = 0;
   let failed = 0;
 
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+  for (let i = 0; i < rewrittenRows.length; i += BATCH_SIZE) {
     if (await isTaskPaused(taskId)) {
       await logToTask(taskId, "info", "Import paused");
       flushManifest(manifestPath, manifest);
@@ -463,7 +550,7 @@ export async function importCsvImport(
       return;
     }
 
-    const batch = rows.slice(i, i + BATCH_SIZE);
+    const batch = rewrittenRows.slice(i, i + BATCH_SIZE);
     const mappedRows = batch.map((row) => {
       const values: Record<string, unknown> = {};
       for (const header of config.csvHeaders) {
@@ -508,7 +595,7 @@ export async function importCsvImport(
     if (imported % 100 === 0) {
       await db.update(tasks).set({ importedItems: imported, failedItems: failed }).where(eq(tasks.id, taskId));
       flushManifest(manifestPath, manifest);
-      await logToTask(taskId, "info", `Insert progress: ${imported}/${rows.length} rows`);
+      await logToTask(taskId, "info", `Insert progress: ${imported}/${rewrittenRows.length} rows`);
     }
   }
 
@@ -525,6 +612,7 @@ export async function importCsvImport(
 
   await db.update(tasks).set({
     status: "completed", completedAt: new Date(), importedItems: imported, failedItems: failed,
+    urlMapping: JSON.stringify(urlMapping),
   }).where(eq(tasks.id, taskId));
 
   await logToTask(taskId, "info", `Import completed. HubDB table "${tableName}" created with ${imported} rows. ${failed} failed.`);
