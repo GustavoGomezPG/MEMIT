@@ -770,3 +770,113 @@ export async function fetchHubDbTableByName(
     return null;
   }
 }
+
+// ── Pages ──
+
+export interface HubSpotPage {
+  id: string;
+  name: string;
+  slug: string;
+  htmlTitle: string;
+  state: string;
+  publishDate: string;
+  created: string;
+  updated: string;
+  url: string;
+  subcategory: string;
+  featuredImage: string;
+  featuredImageAltText: string;
+  metaDescription: string;
+  layoutSections: Record<string, unknown>;
+  templatePath: string;
+  widgetContainers: Record<string, unknown>;
+  widgets: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export async function fetchAllSitePages(
+  token: string
+): Promise<HubSpotPage[]> {
+  const pages: HubSpotPage[] = [];
+  let after: string | undefined;
+  do {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after) params.set("after", after);
+    const res = await hubspotFetch(token, `/cms/v3/pages/site-pages?${params}`);
+    if (!res.ok) throw new Error(`Failed to fetch site pages: ${res.status}`);
+    const data = (await res.json()) as {
+      results: HubSpotPage[];
+      paging?: { next?: { after: string } };
+    };
+    pages.push(...data.results);
+    after = data.paging?.next?.after;
+  } while (after);
+  return pages;
+}
+
+export async function fetchAllLandingPages(
+  token: string
+): Promise<HubSpotPage[]> {
+  const pages: HubSpotPage[] = [];
+  let after: string | undefined;
+  do {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after) params.set("after", after);
+    const res = await hubspotFetch(token, `/cms/v3/pages/landing-pages?${params}`);
+    if (!res.ok) throw new Error(`Failed to fetch landing pages: ${res.status}`);
+    const data = (await res.json()) as {
+      results: HubSpotPage[];
+      paging?: { next?: { after: string } };
+    };
+    pages.push(...data.results);
+    after = data.paging?.next?.after;
+  } while (after);
+  return pages;
+}
+
+export async function createSitePage(
+  token: string,
+  page: Record<string, unknown>
+): Promise<HubSpotPage> {
+  const res = await hubspotFetch(token, "/cms/v3/pages/site-pages", {
+    method: "POST",
+    body: JSON.stringify(page),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create site page: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubSpotPage>;
+}
+
+export async function createLandingPage(
+  token: string,
+  page: Record<string, unknown>
+): Promise<HubSpotPage> {
+  const res = await hubspotFetch(token, "/cms/v3/pages/landing-pages", {
+    method: "POST",
+    body: JSON.stringify(page),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create landing page: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubSpotPage>;
+}
+
+export async function fetchPageBySlug(
+  token: string,
+  slug: string,
+  subcategory: "site_page" | "landing_page" = "site_page"
+): Promise<HubSpotPage | null> {
+  const endpoint = subcategory === "landing_page"
+    ? "/cms/v3/pages/landing-pages"
+    : "/cms/v3/pages/site-pages";
+  const res = await hubspotFetch(
+    token,
+    `${endpoint}?slug=${encodeURIComponent(slug)}&limit=1`
+  );
+  if (!res.ok) return null;
+  const data = (await res.json()) as { results: HubSpotPage[] };
+  return data.results[0] || null;
+}

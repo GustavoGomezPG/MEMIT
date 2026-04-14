@@ -78,3 +78,9 @@ export const BLOG_CSV_COLUMNS = [
 export const HUBDB_CSV_COLUMNS = [
   "tableId", "tableName", "rowId", "path", "name", "values",
 ];
+
+/** Page CSV columns */
+export const PAGE_CSV_COLUMNS = [
+  "id", "name", "slug", "htmlTitle", "state", "subcategory",
+  "publishDate", "url", "templatePath", "metaDescription",
+];
