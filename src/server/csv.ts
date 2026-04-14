@@ -73,3 +73,8 @@ export const BLOG_CSV_COLUMNS = [
   "contentGroupId",
   "blogAuthorId",
 ];
+
+/** HubDB CSV columns */
+export const HUBDB_CSV_COLUMNS = [
+  "tableId", "tableName", "rowId", "path", "name", "values",
+];
