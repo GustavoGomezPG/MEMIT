@@ -608,3 +608,165 @@ export async function fetchStorageUsage(
     return null;
   }
 }
+
+// ── HubDB ──
+
+export interface HubDbColumn {
+  id: number;
+  name: string;
+  label: string;
+  type: string;
+  options?: Array<{ id: string; name: string; type: string }>;
+  [key: string]: unknown;
+}
+
+export interface HubDbTable {
+  id: string;
+  name: string;
+  label: string;
+  columns: HubDbColumn[];
+  rowCount: number;
+  published: boolean;
+  createdAt: string;
+  updatedAt: string;
+  [key: string]: unknown;
+}
+
+export interface HubDbRow {
+  id: string;
+  values: Record<string, unknown>;
+  path?: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export async function fetchAllHubDbTables(
+  token: string
+): Promise<HubDbTable[]> {
+  const tables: HubDbTable[] = [];
+  let after: string | undefined;
+  do {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after) params.set("after", after);
+    const res = await hubspotFetch(token, `/cms/v3/hubdb/tables?${params}`);
+    if (!res.ok) throw new Error(`Failed to fetch HubDB tables: ${res.status}`);
+    const data = (await res.json()) as {
+      results: HubDbTable[];
+      paging?: { next?: { after: string } };
+    };
+    tables.push(...data.results);
+    after = data.paging?.next?.after;
+  } while (after);
+  return tables;
+}
+
+export async function fetchHubDbTable(
+  token: string,
+  tableIdOrName: string
+): Promise<HubDbTable> {
+  const res = await hubspotFetch(token, `/cms/v3/hubdb/tables/${tableIdOrName}`);
+  if (!res.ok) throw new Error(`Failed to fetch HubDB table: ${res.status}`);
+  return res.json() as Promise<HubDbTable>;
+}
+
+export async function fetchAllHubDbRows(
+  token: string,
+  tableId: string
+): Promise<HubDbRow[]> {
+  const rows: HubDbRow[] = [];
+  let after: string | undefined;
+  do {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after) params.set("after", after);
+    const res = await hubspotFetch(
+      token,
+      `/cms/v3/hubdb/tables/${tableId}/rows?${params}`
+    );
+    if (!res.ok) throw new Error(`Failed to fetch HubDB rows: ${res.status}`);
+    const data = (await res.json()) as {
+      results: HubDbRow[];
+      paging?: { next?: { after: string } };
+    };
+    rows.push(...data.results);
+    after = data.paging?.next?.after;
+  } while (after);
+  return rows;
+}
+
+export async function createHubDbTable(
+  token: string,
+  table: { name: string; label: string; columns: Omit<HubDbColumn, "id">[] }
+): Promise<HubDbTable> {
+  const res = await hubspotFetch(token, "/cms/v3/hubdb/tables", {
+    method: "POST",
+    body: JSON.stringify(table),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create HubDB table: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubDbTable>;
+}
+
+export async function createHubDbRow(
+  token: string,
+  tableId: string,
+  row: { values: Record<string, unknown>; path?: string; name?: string }
+): Promise<HubDbRow> {
+  const res = await hubspotFetch(
+    token,
+    `/cms/v3/hubdb/tables/${tableId}/rows`,
+    { method: "POST", body: JSON.stringify(row) }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to create HubDB row: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubDbRow>;
+}
+
+export async function createHubDbRowsBatch(
+  token: string,
+  tableId: string,
+  rows: Array<{ values: Record<string, unknown>; path?: string; name?: string }>
+): Promise<{ results: HubDbRow[] }> {
+  const res = await hubspotFetch(
+    token,
+    `/cms/v3/hubdb/tables/${tableId}/rows/batch/create`,
+    { method: "POST", body: JSON.stringify({ inputs: rows }) }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to batch create HubDB rows: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<{ results: HubDbRow[] }>;
+}
+
+export async function publishHubDbTable(
+  token: string,
+  tableId: string
+): Promise<HubDbTable> {
+  const res = await hubspotFetch(
+    token,
+    `/cms/v3/hubdb/tables/${tableId}/draft/publish`,
+    { method: "POST" }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to publish HubDB table: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<HubDbTable>;
+}
+
+export async function fetchHubDbTableByName(
+  token: string,
+  name: string
+): Promise<HubDbTable | null> {
+  try {
+    const res = await hubspotFetch(token, `/cms/v3/hubdb/tables/${name}`);
+    if (!res.ok) return null;
+    return res.json() as Promise<HubDbTable>;
+  } catch {
+    return null;
+  }
+}
